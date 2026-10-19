@@ -72,6 +72,9 @@ const registeredFontFaceKeys = new Set<string>();
 const loadedFiles = new Set<string>();
 /** FontFace API로 등록한 이름과 파일 조합 (별칭의 지연 등록 지원) */
 const loadedFontFaceKeys = new Set<string>();
+/** [genDOC BAC-2067] 받는 중인 파일. 폰트를 기다리지 않게 되면서 초기화와 문서 열기가 같은 파일을
+ *  동시에 요청할 수 있다 — 두 번 받지 않고 앞 요청을 기다린다(함초롬 2종이 21MB). */
+const inflightFiles = new Map<string, Promise<void>>();
 
 function isExternalFontFile(file: string): boolean {
   return /^https?:\/\//i.test(file);
@@ -300,7 +303,9 @@ export async function loadWebFonts(
     entries.push(entry);
     entriesByFile.set(entry.file, entries);
   }
-  const uniqueToLoad = [...entriesByFile.values()].map(entries => entries[0]);
+  // [genDOC BAC-2067] 앱에 든 작은 woff2 를 먼저, CDN(함초롬 21MB)은 뒤 배치로 — 큰 파일이 작은 글꼴을 붙잡지 않게
+  const uniqueToLoad = [...entriesByFile.values()].map(entries => entries[0])
+    .sort((a, b) => Number(isExternalFontFile(a.file)) - Number(isExternalFontFile(b.file)));
 
   if (uniqueToLoad.length === 0) return;
 
@@ -318,13 +323,20 @@ export async function loadWebFonts(
       const fontNames = entries.map(entry => entry.name).join(', ');
       console.debug(`[FontLoader][debug] CDN 로드 시작: ${fontNames} <- ${f.file}`);
       try {
-        for (const entry of entries) {
-          const fmt = entry.format ?? 'woff2';
-          const face = new FontFace(entry.name, `url(${entry.file}) format('${fmt}')`);
-          const result = await face.load();
-          document.fonts.add(result);
-          loadedFontFaceKeys.add(fontFaceKey(entry));
-        }
+        const prev = inflightFiles.get(f.file);
+        if (prev) await prev;  // 없을 때 await 하지 않아야 get→set 사이에 다른 호출이 끼지 않는다
+        const job = (async () => {
+          for (const entry of entries) {
+            if (loadedFontFaceKeys.has(fontFaceKey(entry))) continue;
+            const fmt = entry.format ?? 'woff2';
+            const face = new FontFace(entry.name, `url(${entry.file}) format('${fmt}')`);
+            const result = await face.load();
+            document.fonts.add(result);
+            loadedFontFaceKeys.add(fontFaceKey(entry));
+          }
+        })();
+        inflightFiles.set(f.file, job.catch(() => {}));
+        try { await job; } finally { inflightFiles.delete(f.file); }
         loadedFiles.add(f.file);
         loaded++;
         console.debug(`[FontLoader][debug] CDN 로드 성공: ${fontNames} <- ${f.file}`);

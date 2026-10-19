@@ -522,12 +522,11 @@ async function initialize(): Promise<void> {
     if (extensionViewerSettings.disableExternalWebFonts) {
       console.info('[main] 외부 웹폰트 사용 안 함 옵션이 켜져 있습니다.');
     }
-    msg.textContent = extensionViewerSettings.disableExternalWebFonts
-      ? '로컬 폰트 준비 중...'
-      : '웹폰트 로딩 중...';
-    await loadWebFonts([], undefined, extensionViewerSettings);  // CSS @font-face 등록 + CRITICAL 폰트만 로드
+    // [genDOC BAC-2067] 함초롬 2종(21MB)을 기다리지 않는다. 쪽 나눔은 WASM 내장 메트릭(HCR Batang/Dotum)으로
+    // 계산하므로 폰트 파일과 무관하다. WASM 을 먼저 받고(대역폭 경쟁 X) 폰트는 뒤에서 받아 다 오면 다시 그린다.
     msg.textContent = 'WASM 로딩 중...';
     await wasm.initialize();
+    void loadWebFonts([], undefined, extensionViewerSettings).then(repaintAfterWebFonts);  // CSS @font-face 등록 + CRITICAL 폰트
     if (import.meta.env.DEV) {
       initRhwpDev(wasm);
     }
@@ -1128,6 +1127,21 @@ function setupZoomControls(): void {
 
 let totalSections = 1;
 let currentDocumentFonts: string[] = [];
+/** [genDOC BAC-2067] 문서 열기는 폰트를 이만큼만 기다린다. 캐시가 있으면 이 안에 끝나 깜빡임이 없고,
+ *  없으면 대체 글꼴로 먼저 보여 준 뒤 폰트가 오면 repaintAfterWebFonts 가 다시 그린다. */
+const DOC_FONT_WAIT_MS = 800;
+
+let documentLoading = false;
+let repaintAfterLoad = false;
+
+/** 폰트가 늦게 도착했을 때 — Rust layout 은 그대로 두고 캔버스 측정 글자만 다시 재서 보이는 쪽을 다시 그린다.
+ *  문서를 여는 중이면 미룬다: 다시 그리기가 renderer 선택 epoch 를 올려 canvasView.loadDocument 가 쪽 목록 없이 끝난다(빈 화면). */
+function repaintAfterWebFonts(): void {
+  if (documentLoading) { repaintAfterLoad = true; return; }
+  if (!canvasView || wasm.pageCount === 0) return;
+  wasm.invalidateCanvasMetricFonts();
+  eventBus.emit('document-view-changed');
+}
 let lastAppliedLocalFontGeneration: string | null = null;
 
 function setupEventListeners(): void {
@@ -1228,11 +1242,7 @@ function setupEventListeners(): void {
     eventBus.emit('document-view-changed');
   });
 
-  document.fonts.addEventListener('loadingdone', () => {
-    if (!canvasView || wasm.pageCount === 0) return;
-    wasm.invalidateCanvasMetricFonts();
-    eventBus.emit('document-view-changed');
-  });
+  document.fonts.addEventListener('loadingdone', repaintAfterWebFonts);
 
   eventBus.on('document-dirty-changed', () => {
     eventBus.emit('command-state-changed');
@@ -1406,6 +1416,7 @@ async function initializeDocument(
   options: { suppressDialogs?: boolean } = {},
 ): Promise<void> {
   const msg = sbMessage();
+  documentLoading = true;
   try {
     setDocumentFontSubstitutions(docInfo.fontSubstitutions);
     currentDocumentFonts = [...(docInfo.fontsUsed ?? [])];
@@ -1413,10 +1424,18 @@ async function initializeDocument(
     console.log('[initDoc] 1. 폰트 로딩 시작');
     await updateLoadProgress(55, '폰트 준비 중...');
     if (docInfo.fontsUsed?.length) {
-      await loadWebFonts(docInfo.fontsUsed, (loaded, total) => {
+      let waiting = true;
+      const fontsLoaded = loadWebFonts(docInfo.fontsUsed, (loaded, total) => {
+        if (!waiting) return;
         const fontPercent = total > 0 ? 55 + Math.round((loaded / total) * 20) : 65;
         msg.textContent = `파일 로딩 ${fontPercent}% - 폰트 로딩 중... (${loaded}/${total})`;
       }, extensionViewerSettings);
+      const timedOut = await Promise.race([
+        fontsLoaded.then(() => false),
+        new Promise<boolean>(resolve => setTimeout(() => resolve(true), DOC_FONT_WAIT_MS)),
+      ]);
+      waiting = false;
+      if (timedOut) void fontsLoaded.then(repaintAfterWebFonts);
     }
     console.log('[initDoc] 2. 폰트 로딩 완료');
     // 저장 snapshot은 권한 prompt 없이 읽을 수 있다. Canvas2D 첫 paint의 family 해소가
@@ -1479,6 +1498,12 @@ async function initializeDocument(
   } catch (error) {
     console.error('[initDoc] 오류:', error);
     if (window.innerWidth < 768) alert(`초기화 오류: ${error}`);
+  } finally {
+    documentLoading = false;
+    if (repaintAfterLoad) {
+      repaintAfterLoad = false;
+      repaintAfterWebFonts();
+    }
   }
 }
 
