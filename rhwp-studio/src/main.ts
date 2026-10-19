@@ -117,7 +117,20 @@ const wasm = new WasmBridge();
 installDocumentTitle(wasm);
 const eventBus = new EventBus();
 const documentState = new DocumentDirtyState(eventBus);
-documentState.installBeforeUnload(window);
+// [genDOC patch 0019 / FE-505·FE-504] genDOC 호스트(iframe 부모) 안에 임베드된 경우,
+// 이탈 경고는 호스트가 제품 모달 + 자체 beforeunload로 단독 소유한다. 엔진이 자체 beforeunload를
+// 설치하면 브라우저 네이티브 alert와 제품 모달이 이중으로 떠서, 임베드 시엔 설치하지 않는다.
+// standalone(직접 접속, parent===window)에서는 기존대로 브라우저 기본 이탈 경고를 유지한다.
+const __genDocEmbed = (() => {
+  try {
+    return window.parent !== window;
+  } catch {
+    return true;
+  }
+})();
+if (!__genDocEmbed) {
+  documentState.installBeforeUnload(window);
+}
 const autosaveManager = new AutosaveManager({
   exportBytes: () => wasm.exportHwp(),
   // exportHwp()는 평문 HWP 바이트를 만든다. 보호 문서에서는 복구본을 남기지 않는다 (#5992).
@@ -125,7 +138,9 @@ const autosaveManager = new AutosaveManager({
   schedule: autosaveScheduleFromUserSettings(),
   onStatus: handleAutosaveStatus,
 });
-autosaveManager.connect(eventBus);
+// [genDOC v0.8.7] host 모드에서는 저장·자동저장을 호스트(계정 DB)가 소유한다. 엔진 로컬 복구본
+// (편집마다 exportHwp + IndexedDB 기록)은 운영(0.7.12)에 없던 동작이라 연결하지 않는다.
+if (!isGenDocHostMode()) autosaveManager.connect(eventBus);
 initThemeSync((effective, mode) => {
   eventBus.emit('theme-changed', { mode, effective });
   eventBus.emit('command-state-changed');
@@ -801,7 +816,7 @@ async function initialize(): Promise<void> {
       await loadFromUrlParam();
       // embed 프로파일: 자동저장 복구 다이얼로그의 드래프트 복원도 호스트가 감지할 수
       // 없는 문서 교체 경로이므로 띄우지 않는다 (드래프트 기록 자체는 유지).
-      if (chromeMode !== 'embed') await offerAutosaveRecoveryIfIdle();
+      if (chromeMode !== 'embed' && !isGenDocHostMode()) await offerAutosaveRecoveryIfIdle();
       await openBlankDocumentIfIdle();
     })();
     // embed 프로파일: PWA launch queue로 문서를 넘겨받는 진입도 문서 교체 경로이므로
@@ -1220,6 +1235,31 @@ function setupEventListeners(): void {
   eventBus.on('document-dirty-changed', () => {
     eventBus.emit('command-state-changed');
   });
+
+  // [genDOC patch 0019 / FE-505·FE-504] dirty/변경 신호를 부모(genDOC 호스트)로 브리지한다(임베드 시에만).
+  // - gendoc:rhwp:dirty  : 권위 있는 dirty 상태. 로드/저장 시 markClean → dirty:false 가 전달돼
+  //                        호스트가 autosave 타이머를 취소하고 '저장됨' 상태로 되돌린다.
+  // - gendoc:rhwp:changed: 편집 1회 펄스. 호스트가 "마지막 입력 후 N초" 디바운스를 재무장하는 데 쓴다
+  //                        (dirty-changed 는 전이 시 1회만 emit 되므로 디바운스용으로 부족).
+  if (__genDocEmbed) {
+    eventBus.on('document-dirty-changed', (change) => {
+      const dirty = !!(change as { dirty?: boolean } | undefined)?.dirty;
+      try {
+        window.parent.postMessage({ type: 'gendoc:rhwp:dirty', dirty }, '*');
+      } catch {
+        /* 호스트 없음 — 무시 */
+      }
+    });
+    const postGenDocChanged = (): void => {
+      try {
+        window.parent.postMessage({ type: 'gendoc:rhwp:changed' }, '*');
+      } catch {
+        /* 호스트 없음 — 무시 */
+      }
+    };
+    eventBus.on('document-changed', postGenDocChanged);
+    eventBus.on('document-mutated', postGenDocChanged);
+  }
 
   eventBus.on('autosave-settings-changed', () => {
     autosaveManager.updateSchedule(autosaveScheduleFromUserSettings());
@@ -1806,6 +1846,9 @@ async function createNewDocument(): Promise<void> {
  */
 async function openBlankDocumentIfIdle(): Promise<void> {
   if (chromeMode === 'embed') return;
+  // [genDOC v0.8.7] host 모드도 호스트가 loadFile/newDocument 로 문서를 넣는다 — 빈 문서를 먼저 열면
+  // 호스트 loadFile 과 initializeDocument 가 겹칠 수 있다.
+  if (isGenDocHostMode()) return;
   if (wasm.pageCount > 0 || documentState.isDirty()) return;
   await createNewDocument();
 }
@@ -2709,7 +2752,8 @@ installEmbedRuntime({
       if (!await canReplaceCurrentDocument(skipUnsavedGuard)) {
         throw new Error('문서 열기가 취소되었습니다.');
       }
-      await loadBytes(data, fileName, null, undefined, { suppressDialogs });
+      // [genDOC] host 모드 문서는 호스트(계정 DB)가 관리한다 — 브라우저 「최근 문서」에 남기지 않는다(운영 0.7.12 동작).
+      await loadBytes(data, fileName, null, undefined, { suppressDialogs, skipRecent: isGenDocHostMode() });
       return { pageCount: wasm.pageCount };
     },
     async pageCount() {
