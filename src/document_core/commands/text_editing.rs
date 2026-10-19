@@ -4540,6 +4540,90 @@ impl DocumentCore {
     ///
     /// `restore_meta` 는 병합 undo 전용이다 — 병합으로 사라졌던 문단의 스코프 메타를
     /// 되돌린다. `None` 이면 기존 Enter 분할 시맨틱 그대로다 (Task #2342).
+    /// [genDOC patch 0033] 셀 끝에 새 텍스트 문단을 추가한다 — 셀 안 개체 앵커 보존 삽입.
+    ///
+    /// insert_text_in_cell 은 기존 문단의 문자 흐름에 삽입하므로, 셀 문단에 treat_as_char
+    /// 개체(안내 글상자 등)의 앵커가 있으면 삽입량만큼 앵커가 뒤로 밀려 개체가 떠다닌다
+    /// (예창패 요약표 안내 박스 밀림 사고). 이 메서드는 기존 문단들을 전혀 건드리지 않고
+    /// 셀 paragraphs 끝에 새 문단을 push 하므로 앵커 위치가 불변이다. 스타일은 셀 첫 문단의
+    /// para/char shape 를 상속한다.
+    pub fn append_text_paragraph_in_cell_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        text: &str,
+    ) -> Result<String, HwpError> {
+        // 스타일 상속원: 셀 첫 문단 (접근 검증 겸용).
+        let (para_shape_id, base_char_shape) = {
+            let first = self.get_cell_paragraph_mut(
+                section_idx, parent_para_idx, control_idx, cell_idx, 0,
+            )?;
+            (first.para_shape_id, first.char_shape_id_at(0).unwrap_or(0))
+        };
+        let mut new_para = crate::model::paragraph::Paragraph::new_empty();
+        new_para.para_shape_id = para_shape_id;
+        // [genDOC patch 0057 / BAC-1821] new_empty() 는 char_shapes 가 비어 있어 아래 apply_char_shape_range 도,
+        // 뒤따르는 applyCharFormatInCell(fontSize) 도 아무것도 바꾸지 못했다 → 덧붙인 줄만 기본 글자모양으로 그려졌다.
+        new_para.char_shapes = vec![crate::model::paragraph::CharShapeRef { start_pos: 0, char_shape_id: base_char_shape }];
+        new_para.insert_text_at(0, text);
+        let text_len = text.chars().count();
+        if text_len > 0 {
+            new_para.apply_char_shape_range(0, text_len, base_char_shape);
+        }
+
+        let new_cell_para_idx = match self.document.sections[section_idx]
+            .paragraphs[parent_para_idx].controls.get_mut(control_idx)
+        {
+            Some(Control::Table(table)) => {
+                let cell = table.cells.get_mut(cell_idx).ok_or_else(|| {
+                    HwpError::RenderError(format!("셀 인덱스 {} 범위 초과", cell_idx))
+                })?;
+                let idx = cell.paragraphs.len();
+                cell.paragraphs.push(new_para);
+                idx
+            }
+            Some(Control::Shape(shape)) => {
+                match super::super::helpers::get_textbox_from_shape_mut(shape) {
+                    Some(tb) => {
+                        let idx = tb.paragraphs.len();
+                        tb.paragraphs.push(new_para);
+                        idx
+                    }
+                    None => {
+                        return Err(HwpError::RenderError(
+                            "글상자가 아닌 도형에는 문단을 추가할 수 없습니다".to_string(),
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(HwpError::RenderError(
+                    "표/글상자 컨트롤이 아닙니다".to_string(),
+                ))
+            }
+        };
+
+        // 새 문단만 셀 폭 기준 리플로우 — 기존 문단·앵커는 무변경. vpos 는 split 과 같이 셀 안에서 잇는다.
+        self.reflow_cell_paragraph(section_idx, parent_para_idx, control_idx, cell_idx, new_cell_para_idx);
+        self.recalculate_cell_paragraph_vpos_native(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            new_cell_para_idx,
+            None,
+        );
+        self.mark_cell_control_dirty(section_idx, parent_para_idx, control_idx);
+        self.document.sections[section_idx].raw_stream = None;
+        self.mark_section_dirty(section_idx);
+        self.paginate_if_needed();
+
+        self.event_log.push(DocumentEvent::CellTextChanged { section: section_idx, para: parent_para_idx, ctrl: control_idx, cell: cell_idx });
+        Ok(super::super::helpers::json_ok_with(&format!("\"cellParaIndex\":{}", new_cell_para_idx)))
+    }
+
     pub fn split_paragraph_in_cell_native(
         &mut self,
         section_idx: usize,

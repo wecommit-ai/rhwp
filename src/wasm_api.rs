@@ -1613,6 +1613,28 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// [genDOC patch 0033] 셀 끝에 새 텍스트 문단을 추가한다 — 셀 안 개체 앵커 보존 삽입.
+    ///
+    /// 반환값: JSON `{"ok":true,"cellParaIndex":<new_idx>}`
+    #[wasm_bindgen(js_name = appendTextParagraphInCell)]
+    pub fn append_text_paragraph_in_cell(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+        cell_idx: u32,
+        text: &str,
+    ) -> Result<String, JsValue> {
+        self.append_text_paragraph_in_cell_native(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            text,
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 표 셀 내부 문단에서 텍스트를 삭제한다.
     ///
     /// 반환값: JSON `{"ok":true,"charOffset":<offset_after_delete>}`

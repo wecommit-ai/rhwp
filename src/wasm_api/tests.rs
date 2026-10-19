@@ -2776,6 +2776,24 @@ fn issue2214_invalid_shape_cell_index_does_not_mutate_text() {
 }
 
 #[test]
+fn bac1821_appended_cell_paragraph_keeps_cell_char_shape() {
+    // [genDOC 0033·0057] 1623 「회사 소개」: 셀에 덧붙인 문단의 char_shapes 가 비어 기본 글자모양(맑은 고딕)으로 그려지고 fontSize 도 안 먹었다
+    let mut doc = create_doc_with_table();
+    if let Some(Control::Table(t)) = doc.document.sections[0].paragraphs[0].controls.get_mut(0) {
+        t.cells[0].paragraphs[0].char_shapes = vec![crate::model::paragraph::CharShapeRef { start_pos: 0, char_shape_id: 3 }];
+    }
+    let before = match doc.document.sections[0].paragraphs[0].controls.get(0) { Some(Control::Table(t)) => t.cells[0].paragraphs.len(), _ => 0 };
+    let r = doc.append_text_paragraph_in_cell_native(0, 0, 0, 0, "둘째 줄").unwrap();
+    assert!(r.contains(&format!("\"cellParaIndex\":{}", before)), "{r}");
+    if let Some(Control::Table(t)) = doc.document.sections[0].paragraphs[0].controls.get(0) {
+        let p = t.cells[0].paragraphs.last().unwrap();
+        assert_eq!(p.text, "둘째 줄");
+        assert_eq!(p.char_shapes.iter().map(|r| (r.start_pos, r.char_shape_id)).collect::<Vec<_>>(), vec![(0, 3)]);
+        assert!(!p.line_segs.is_empty(), "셀 폭 리플로우됨");
+    } else { panic!("표 없음"); }
+}
+
+#[test]
 fn test_delete_text_in_cell() {
     let mut doc = create_doc_with_table();
     let result = doc.delete_text_in_cell_native(0, 0, 0, 1, 0, 0, 1);
