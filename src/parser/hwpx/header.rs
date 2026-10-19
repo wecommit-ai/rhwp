@@ -1603,6 +1603,9 @@ fn parse_border_fill(
             }
             // [#2973] 필드와 함께 attr bit0(표 24 3D 효과)도 동기화한다 — 방출측
             // (#2965)이 attr 비트에서 읽으므로, centerLine(bit13)과 같은 패턴.
+            b"breakCellSeparateLine" => {
+                bf.break_cell_separate_line = parse_bool(&attr);
+            }
             b"threeD" => {
                 bf.three_d = parse_bool(&attr);
                 if bf.three_d {

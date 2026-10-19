@@ -370,7 +370,7 @@ fn write_border_fill<W: Write>(
             ("threeD", three_d),
             ("shadow", shadow),
             ("centerLine", center_line_type(bf)),
-            ("breakCellSeparateLine", "0"),
+            ("breakCellSeparateLine", bool01(bf.break_cell_separate_line)),
         ],
     )?;
 
@@ -1950,6 +1950,18 @@ mod tests {
             xml.contains(r#"<hh:backSlash type="CENTER" Crooked="0" isCounter="0"/>"#),
             "backSlash CENTER 가 보존되어야 함: {xml}"
         );
+    }
+
+    /// [genDOC BAC-1856] breakCellSeparateLine 을 "0" 으로 고정하지 않고 모델 값을 쓴다(0063 대체 후 남은 차이).
+    #[test]
+    fn gendoc_write_border_fill_keeps_break_cell_separate_line() {
+        let mut bf = BorderFill::default();
+        bf.break_cell_separate_line = true;
+        let mut writer = Writer::new(Vec::new());
+        write_border_fill(&mut writer, 0, &bf, &SerializeContext::collect_from_document(&Default::default()))
+            .expect("write borderFill");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+        assert!(xml.contains(r#"breakCellSeparateLine="1""#), "{xml}");
     }
 
     #[test]

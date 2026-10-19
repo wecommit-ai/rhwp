@@ -403,6 +403,7 @@ fn parse_border_fill(data: &[u8]) -> Result<BorderFill, DocInfoError> {
         center_line: CenterLine::from_hwp_attr(attr),
         fill,
         three_d: false,
+        break_cell_separate_line: false,
     })
 }
 

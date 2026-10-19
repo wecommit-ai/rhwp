@@ -597,6 +597,9 @@ pub struct BorderFill {
     pub fill: Fill,
     /// 3차원 효과 (HWPX borderFill@threeD)
     pub three_d: bool,
+    /// [genDOC BAC-1856] HWPX borderFill@breakCellSeparateLine (자동으로 나뉜 표의 경계선). HWP 바이너리 속성 비트에는
+    /// 없어서 HWPX 왕복에서만 보존한다(0063 원본 XML 재사용을 v0.8.7 구조 직렬화로 바꾸며 남은 차이).
+    pub break_cell_separate_line: bool,
 }
 
 /// 중심선 방향 (HWPX borderFill@centerLine)
