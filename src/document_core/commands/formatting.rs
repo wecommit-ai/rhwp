@@ -1071,15 +1071,15 @@ impl DocumentCore {
             // 본문: 열 상자.
             let paragraph_box = ParagraphBox::body_for_style(col_width, para_style, self.dpi);
             // 원본 LineSeg 무효화 → reflow가 max_font_size에서 새로 계산
-            self.document.sections[sec_idx].paragraphs[para_idx]
-                .line_segs
-                .clear();
-            reflow_line_segs(
-                &mut self.document.sections[sec_idx].paragraphs[para_idx],
-                paragraph_box,
-                &styles,
-                self.dpi,
-            );
+            // [genDOC patch 0062 / BAC-1822] 다 지우면 reflow 가 vpos 를 0 부터 다시 매긴다. vpos 0 은 쪽 시작
+            // 신호라 쪽 나눔이 이 문단을 다음 쪽 첫 줄로 보냈다(s02 제목에 글자 입력 → 2쪽이 3쪽). 원래 시작 vpos 를 잇는다.
+            let para = &mut self.document.sections[sec_idx].paragraphs[para_idx];
+            let orig_vpos = para.line_segs.first().map(|s| s.vertical_pos).unwrap_or(0);
+            para.line_segs.clear();
+            reflow_line_segs(para, paragraph_box, &styles, self.dpi);
+            for seg in &mut para.line_segs {
+                seg.vertical_pos += orig_vpos;
+            }
         }
 
         self.document.sections[sec_idx].raw_stream = None;

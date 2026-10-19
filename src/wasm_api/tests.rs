@@ -2111,6 +2111,24 @@ fn create_doc_with_page_count_boundary_table() -> HwpDocument {
 }
 
 #[test]
+fn bac1822_char_format_keeps_paragraph_vpos() {
+    // [genDOC 0062] s02 「2. 과업내용 및 범위」: 글자 크기를 다시 입히면 그 문단 lineseg vpos 가 0 이 돼(쪽 시작 신호)
+    // 그 문단부터 다음 쪽으로 밀렸다(2→3쪽).
+    let mut doc = create_doc_with_table();
+    let sec = &mut doc.document.sections[0];
+    let mut p = sec.paragraphs[0].clone();
+    p.controls.clear();
+    p.text = "본문 문단".to_string();
+    p.char_offsets = (0..5).collect();
+    p.char_count = 6;
+    p.line_segs = vec![crate::model::paragraph::LineSeg { vertical_pos: 14880, line_height: 1600, text_height: 1600, line_spacing: 960, ..Default::default() }];
+    sec.paragraphs.push(p);
+    let pi = sec.paragraphs.len() - 1;
+    doc.apply_char_format_native(0, pi, 0, 5, r#"{"fontSize":1600}"#).unwrap();
+    assert_eq!(doc.document.sections[0].paragraphs[pi].line_segs[0].vertical_pos, 14880);
+}
+
+#[test]
 fn test_insert_text_in_cell() {
     let mut doc = create_doc_with_table();
     let result = doc.insert_text_in_cell_native(0, 0, 0, 0, 0, 1, "추가");
