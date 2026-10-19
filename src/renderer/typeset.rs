@@ -6969,6 +6969,29 @@ mod tests {
         }
     }
 
+    /// [genDOC 0064 / BAC-1840] LINE_SEG lh 가 그림보다 작게 남은 빈 문단의 글자처럼 그림.
+    /// 레이아웃은 그림 높이만큼 내려 그리므로 조판도 그림 높이로 세야 다음 문단이 쪽 밖으로 넘치지 않는다.
+    #[test]
+    fn bac1840_tac_picture_taller_than_line_seg_counts_picture_height() {
+        let engine = TypesetEngine::with_default_dpi();
+        let styles = ResolvedStyleSet::default();
+        let mut paras: Vec<Paragraph> = (0..10).map(|_| make_paragraph_with_height(2000)).collect();
+        let mut pic_para = make_paragraph_with_height(900);
+        let mut pic = crate::model::image::Picture::default();
+        pic.common.treat_as_char = true;
+        pic.common.height = 60000; // 800px — 줄 정보(12px)보다 훨씬 큼
+        pic_para.controls.push(Control::Picture(Box::new(pic)));
+        paras.push(pic_para);
+        paras.push(make_paragraph_with_height(2000));
+        let composed: Vec<ComposedParagraph> = Vec::new();
+        let result = engine.typeset_section(
+            &paras, &composed, &styles, &a4_page_def(), &ColumnDef::default(), 0, &[], false,
+            &std::collections::HashSet::new(),
+        );
+        let page_of = |pi: usize| result.pages.iter().position(|p| p.column_contents.iter().any(|c| c.items.iter().any(|it| matches!(it, PageItem::FullParagraph { para_index, .. } if *para_index == pi)))).unwrap();
+        assert!(page_of(10) > page_of(0), "그림 문단(267px 뒤 800px)은 첫 쪽에 들어갈 수 없다: pages={}", result.pages.len());
+    }
+
     #[test]
     fn test_typeset_engine_creation() {
         let engine = TypesetEngine::new(96.0);

@@ -51,8 +51,28 @@ pub(in crate::renderer::typeset) fn format_paragraph_for_flow(
     // 이 이미 동일 역할을 담당하므로 이중 패딩이 발생 (한컴 PDF 대비 +48px excess, 4·5쪽
     // 누적 +17~30pt 사용자 피드백). zone 전환 패딩만 유지.
 
-    let (line_heights, line_spacings) =
+    let (mut line_heights, line_spacings) =
         resolve_line_metrics(ctx, para, composed, styles, para_style, column_width_px);
+
+    // [genDOC patch 0064 / BAC-1840] 텍스트 없는 문단의 글자처럼 그림: 레이아웃은
+    // max(LINE_SEG lh+ls, 그림 높이) 만큼 진행한다. LINE_SEG 가 그림보다 작게 남은 문서(편집기로 그림을
+    // 넣고 줄 정보를 다시 계산하지 않은 HWP)는 여기서 lh 만 세면 다음 문단이 쪽 아래로 넘쳐 잘린다.
+    let tac_pic_h = if para.text.chars().any(|c| c > '\u{001F}' && c != '\u{FFFC}') {
+        0.0
+    } else {
+        para.controls
+            .iter()
+            .filter_map(|c| match c {
+                Control::Picture(p) if p.common.treat_as_char => {
+                    Some(hwpunit_to_px(p.common.height as i32, ctx.dpi()))
+                }
+                _ => None,
+            })
+            .fold(0.0f64, f64::max)
+    };
+    if tac_pic_h > 0.0 && !line_heights.is_empty() {
+        line_heights[0] = line_heights[0].max(tac_pic_h - line_spacings[0]);
+    }
 
     let lines_total: f64 = line_heights
         .iter()
@@ -124,7 +144,8 @@ pub(in crate::renderer::typeset) fn format_paragraph_for_flow(
         } else {
             None
         };
-        vpos_metric.map(|v| metric.min(v)).unwrap_or(metric)
+        // [genDOC patch 0064] 그림은 아래 끝까지 들어가야 한다.
+        vpos_metric.map(|v| metric.min(v)).unwrap_or(metric).max(spacing_before + tac_pic_h)
     };
 
     // 표 없는 일반 본문에는 배치용 줄 사본을 만들지 않는다.
