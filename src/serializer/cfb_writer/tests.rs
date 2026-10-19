@@ -1802,3 +1802,63 @@ fn test_compressed_ole_storage_payload_is_deflated() {
     );
     assert_eq!(&payload[4..], &ole_cfb[..]);
 }
+
+/// [genDOC patch 0032] 재직렬화해도 ID_MAPPINGS(변경 추적 개수 포함)·TABLE 레코드 크기가 원본과 같아야 한글이 연다.
+#[test]
+fn gendoc_reserialize_preserves_id_mappings_and_table_record_sizes() {
+    use crate::parser::record::Record;
+    use crate::parser::tags::{HWPTAG_ID_MAPPINGS, HWPTAG_TABLE};
+    let record_data = |stream: &[u8], tag: u16| -> Vec<Vec<u8>> {
+        Record::read_all(stream).unwrap().into_iter().filter(|r| r.tag_id == tag).map(|r| r.data).collect()
+    };
+    for path in ["samples/복학원서.hwp", "samples/hwp_table_test-m.hwp"] {
+        let data = std::fs::read(path).unwrap();
+        let mut doc = crate::parser::parse_hwp(&data).unwrap();
+        let orig_di = doc.doc_info.raw_stream.clone().unwrap();
+        doc.doc_info.raw_stream_dirty = true; // 편집 후 저장 경로 강제
+        let reser_di = crate::serializer::doc_info::serialize_doc_info(&doc.doc_info, &doc.doc_properties);
+        let (o, r) = (record_data(&orig_di, HWPTAG_ID_MAPPINGS), record_data(&reser_di, HWPTAG_ID_MAPPINGS));
+        assert_eq!(o.iter().map(|d| d.len()).collect::<Vec<_>>(), r.iter().map(|d| d.len()).collect::<Vec<_>>(), "{path}: ID_MAPPINGS 크기");
+        if o[0].len() >= 72 {
+            assert_eq!(o[0][64..72], r[0][64..72], "{path}: 변경 추적 개수가 0 으로 덮임");
+        }
+        for (i, section) in doc.sections.iter_mut().enumerate() {
+            let orig_sec = section.raw_stream.take().unwrap();
+            let reser_sec = crate::serializer::body_text::serialize_section(section);
+            assert_eq!(
+                record_data(&orig_sec, HWPTAG_TABLE).iter().map(|d| d.len()).collect::<Vec<_>>(),
+                record_data(&reser_sec, HWPTAG_TABLE).iter().map(|d| d.len()).collect::<Vec<_>>(),
+                "{path} Section{i}: HWPTAG_TABLE 크기"
+            );
+        }
+    }
+}
+
+/// [genDOC patch 0032] 옛 genDOC 엔진이 5.0.3.2 이상 파일의 ID_MAPPINGS 를 16필드로 저장했으면(grants 2404 한글 미개봉)
+/// 다시 열어 저장할 때 DocInfo 를 재직렬화해 18필드로 고친다.
+#[test]
+fn gendoc_legacy_16field_id_mappings_is_rewritten_on_save() {
+    use crate::parser::record::Record;
+    use crate::parser::tags::HWPTAG_ID_MAPPINGS;
+    let data = std::fs::read("samples/복학원서.hwp").unwrap();
+    let mut doc = crate::parser::parse_hwp(&data).unwrap();
+    let v = &doc.header.version;
+    assert!((v.major, v.minor, v.build, v.revision) >= (5, 0, 3, 2), "시험 전제: 5.0.3.2 이상");
+    // 옛 genDOC 산출물 흉내: ID_MAPPINGS 를 16필드(64바이트)로 잘라 DocInfo 원본 스트림을 다시 만든다.
+    doc.doc_info.raw_stream_dirty = true;
+    let di = crate::serializer::doc_info::serialize_doc_info(&doc.doc_info, &doc.doc_properties);
+    let mut legacy = Vec::new();
+    for r in Record::read_all(&di).unwrap() {
+        let d = if r.tag_id == HWPTAG_ID_MAPPINGS { r.data[..64].to_vec() } else { r.data.clone() };
+        legacy.extend(crate::serializer::record_writer::write_record(r.tag_id, r.level, &d));
+    }
+    let (mut di2, _) = crate::parser::doc_info::parse_doc_info(&legacy).unwrap();
+    di2.raw_stream = Some(legacy);
+    assert!(!di2.id_mappings_has_track_change);
+    let hdr = crate::parser::header::parse_file_header(&{
+        let mut cfb = crate::parser::cfb_reader::CfbReader::open(&data).unwrap();
+        cfb.read_file_header().unwrap()
+    }).unwrap();
+    crate::parser::gendoc_force_id_mappings_rewrite(&mut di2, &hdr);
+    assert!(di2.raw_stream_dirty, "옛 16필드 DocInfo 는 다음 저장에서 재직렬화돼야 함");
+}

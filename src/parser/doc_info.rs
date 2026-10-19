@@ -52,6 +52,9 @@ struct IdMappings {
     para_shape_count: u32,
     style_count: u32,
     memo_shape_count: u32,
+    track_change_count: u32,
+    track_change_author_count: u32,
+    has_track_change: bool,
 }
 
 /// DocInfo 스트림 파싱
@@ -80,6 +83,9 @@ pub fn parse_doc_info(data: &[u8]) -> Result<(DocInfo, DocProperties), DocInfoEr
                 id_mappings = parse_id_mappings(&record.data)?;
                 doc_info.bullet_count = id_mappings.bullet_count;
                 doc_info.memo_shape_count = id_mappings.memo_shape_count;
+                doc_info.track_change_count = id_mappings.track_change_count;
+                doc_info.track_change_author_count = id_mappings.track_change_author_count;
+                doc_info.id_mappings_has_track_change = id_mappings.has_track_change;
             }
             tags::HWPTAG_BIN_DATA => {
                 let mut bin_data = parse_bin_data(&record.data)?;
@@ -228,6 +234,12 @@ fn parse_id_mappings(data: &[u8]) -> Result<IdMappings, DocInfoError> {
     } else {
         0
     };
+    // [genDOC patch 0032] 17·18번째 필드: 변경 추적 / 변경 추적 작성자 개수 (5.0.3.2 이후)
+    m.has_track_change = r.remaining() >= 8;
+    if m.has_track_change {
+        m.track_change_count = r.read_u32().unwrap_or(0);
+        m.track_change_author_count = r.read_u32().unwrap_or(0);
+    }
 
     Ok(m)
 }

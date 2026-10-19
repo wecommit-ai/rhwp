@@ -226,6 +226,13 @@ pub struct DocInfo {
     pub bullet_count: u32,
     /// MemoShape 개수 (ID_MAPPINGS에 포함, 현재 파싱 미지원이지만 보존 필요)
     pub memo_shape_count: u32,
+    /// [genDOC patch 0032] ID_MAPPINGS 17·18번째 필드(변경 추적·변경 추적 작성자 개수). 원본 값을 그대로 다시 쓴다.
+    pub track_change_count: u32,
+    pub track_change_author_count: u32,
+    /// [genDOC patch 0032] 원본 ID_MAPPINGS 에 위 두 필드가 있었는가.
+    pub id_mappings_has_track_change: bool,
+    /// [genDOC patch 0032] 5.0.3.2 미만 HWP 원본의 16필드 ID_MAPPINGS 는 16필드 그대로 쓴다.
+    pub id_mappings_keep_16_fields: bool,
     /// HWPX 헤더 `<hh:refList>` 안의 `<hh:memoProperties>...</hh:memoProperties>`
     /// (또는 자기닫힘) 블록을 원본 그대로 보존한다. `extra_records`의
     /// HWPTAG_MEMO_SHAPE 바이너리는 hwpx→hwp5 변환 전용이라 hwpx→hwpx

@@ -232,8 +232,11 @@ pub fn serialize_id_mappings(doc_info: &DocInfo) -> Vec<u8> {
     // 최근 한컴 생성 HWP는 ID_MAPPINGS 뒤쪽 reserved count 2개까지 포함한
     // 18개 u32 테이블을 쓴다. HWPX에서 DocInfo를 새로 구성할 때도 이
     // 길이를 맞춰 한컴의 DocInfo contract와 동일한 형태로 직렬화한다.
-    w.write_u32(0).unwrap();
-    w.write_u32(0).unwrap();
+    // [genDOC patch 0032] 원본 변경 추적 개수를 0 으로 덮지 않는다(레코드는 extra_records 로 보존되므로 개수가 어긋난다).
+    if !doc_info.id_mappings_keep_16_fields {
+        w.write_u32(doc_info.track_change_count).unwrap();
+        w.write_u32(doc_info.track_change_author_count).unwrap();
+    }
 
     w.into_bytes()
 }

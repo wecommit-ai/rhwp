@@ -377,6 +377,21 @@ fn parse_doc_info_stream(
     })
 }
 
+/// [genDOC patch 0032] 5.0.3.2 이상 파일은 ID_MAPPINGS 에 변경 추적 개수 2필드가 필수다. 옛 genDOC 엔진이
+/// 16필드로 저장한 파일(grants 2404 한글 미개봉)은 원본 스트림을 그대로 다시 쓰면 계속 깨진 채 남으므로,
+/// 다음 저장에서 DocInfo 재직렬화를 강제해 고친다.
+pub(crate) fn gendoc_force_id_mappings_rewrite(
+    doc_info: &mut crate::model::document::DocInfo,
+    file_header: &header::FileHeader,
+) {
+    let v = &file_header.version;
+    let required = (v.major, v.minor, v.build, v.revision) >= (5, 0, 3, 2);
+    doc_info.id_mappings_keep_16_fields = !required && !doc_info.id_mappings_has_track_change;
+    if required && !doc_info.id_mappings_has_track_change {
+        doc_info.raw_stream_dirty = true;
+    }
+}
+
 fn parse_hwp_inner(data: &[u8], password: Option<&[u8]>) -> Result<Document, ParseError> {
     parse_hwp_inner_with_limits(data, password, document_open_decompression_policy().hwp5)
 }
@@ -454,6 +469,7 @@ fn parse_hwp_with_cfb(
         .map_err(ParseError::CfbError)?;
     let (mut doc_info, doc_properties) = parse_doc_info_stream(&doc_info_data, encrypted)?;
     doc_info.raw_stream = Some(doc_info_data);
+    gendoc_force_id_mappings_rewrite(&mut doc_info, &file_header);
 
     // 4. BodyText 섹션별 파싱
     let section_count = cfb.section_count();
@@ -942,6 +958,7 @@ fn parse_hwp_with_lenient(
         .map_err(ParseError::CfbError)?;
     let (mut doc_info, doc_properties) = parse_doc_info_stream(&doc_info_data, encrypted)?;
     doc_info.raw_stream = Some(doc_info_data);
+    gendoc_force_id_mappings_rewrite(&mut doc_info, &file_header);
 
     // BodyText 섹션별 파싱
     let section_count = lenient.section_count();
