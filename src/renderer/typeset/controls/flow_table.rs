@@ -91,7 +91,13 @@ pub(in crate::renderer::typeset) fn place(
         .find(|mt| mt.para_index == para_idx && mt.control_index == ctrl_idx);
     let is_first_placed = first_placed_table == Some(ctrl_idx);
     let is_last_placed = last_placed_table == Some(ctrl_idx);
-    if engine.is_effective_tac_table(para, table, fmt) {
+    // [genDOC patch 0020 / Task #485·BAC-425] 빈 쪽 전체보다 큰 글자처럼 취급 표는 통째 배치가 불가능하다 — 그대로
+    // 두면 쪽 바닥 아래로 넘쳐 보이지 않는다(셀을 채운 공고 1623 「제출서류」 표 1310px). 일반 표와 같은 행 단위
+    // 분할 경로로 보내 다음 쪽에 이어 보이게 한다.
+    // 원본 쪽나눔이 「나누지 않음」인 표는 행 분할 경로로 보내도 나뉘지 않는다 — upstream 통째 배치를 그대로 둔다.
+    let tac_too_tall = table.page_break != crate::model::table::TablePageBreak::None
+        && mt.is_some_and(|m| ft.total_height.max(m.total_height) > st.base_available_height() + 0.5);
+    if engine.is_effective_tac_table(para, table, fmt) && !tac_too_tall {
         if !engine.render_normalization.table_text_reflowed(table) {
             if let Some(placement) = super::stored_tac::prepare_coanchored_first_line(
                 ctrl_idx,

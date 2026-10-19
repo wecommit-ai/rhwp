@@ -71,13 +71,21 @@ pub(super) fn prepare(
         .then(|| {
             para.controls.iter().enumerate().find_map(|(ci, ctrl)| {
                 let Control::Table(t) = ctrl else { return None };
+                let declared = hwpunit_to_px(t.common.height as i32, dpi);
+                // [genDOC v0.8.7] 실측이 선언 높이의 1.5배를 넘는 표는 선언값이 stale 하다(#1835 와 같은 기준 —
+                // 그런 표는 비례 축소도 하지 않고 내용대로 그린다). 쪽 나눔도 실측으로 세야 표가 쪽 밖으로
+                // 넘치지 않는다(옛 genDOC 엔진이 셀을 채워 저장한 공고 660 「사업추진 일정」: 선언 149px, 실측 980px).
+                let stale_declared = measured_tables
+                    .iter()
+                    .find(|m| m.para_index == para_idx && m.control_index == ci)
+                    .is_some_and(|m| declared > 0.0 && m.total_height > declared * 1.5);
                 if !flow.is_effective_tac_table(para, t, fmt)
                     || !(flow.session_edited()
+                        || stale_declared
                         || flow.single_tac_line_has_unstored_cell_text(para, t, fmt, tac_count))
                 {
                     return None;
                 }
-                let declared = hwpunit_to_px(t.common.height as i32, dpi);
                 measured_tables
                     .iter()
                     .find(|m| m.para_index == para_idx && m.control_index == ci)
@@ -213,12 +221,24 @@ pub(super) fn prepare(
                 page.current_height + fmt.line_advances_sum(0..owner) <= available_height()
             })
     });
+    // [genDOC patch 0050 / BAC-1813] 빈 쪽 전체보다 큰 TAC 표는 행 단위로 나뉜다(패치 0008 flow_table). 다음 쪽으로
+    // 미리 넘기면 앞 제목만 남은 거의 빈 쪽이 생긴다(공고 1623 초안 1쪽 25자, 7299 「3. 참가계획」). 현재 위치에서 나눈다.
+    let single_tac_will_split = tac_count == 1
+        && para.controls.iter().enumerate().any(|(ci, c)| {
+            // 원본이 「나누지 않음」인 표는 나뉘지 않으므로 제외한다(실제 초안 r680 1쪽 942px 표가 제자리에 남아 넘쳤다).
+            matches!(c, Control::Table(t) if flow.is_effective_tac_table(para, t, fmt)
+                && t.page_break != crate::model::table::TablePageBreak::None)
+                && measured_tables.iter().any(|m| {
+                    m.para_index == para_idx && m.control_index == ci && m.total_height > available_height() + 0.5
+                })
+        });
     let advance_before_place = page.current_height + height_for_fit > available_height()
         && !page.current_items.is_empty()
         && has_tac
         && tac_count <= 1
         && !saved_single_tac_bottom_fits
-        && !prefix_fits_separately;
+        && !prefix_fits_separately
+        && !single_tac_will_split;
     TacFitPlan {
         tac_count,
         has_tac,

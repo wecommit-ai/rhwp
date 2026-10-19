@@ -5963,6 +5963,75 @@ mod tests {
         assert_eq!(typeset_reserved, expected);
     }
 
+    /// [genDOC 0020 / Task #485·BAC-425] 빈 쪽보다 큰 글자처럼 취급 표는 통째 배치 대신 행 단위로 나뉘어야 한다
+    /// (셀을 채운 공고 1623 「제출서류」 표 1310px 가 쪽 바닥 아래로 넘쳤다).
+    #[test]
+    fn gendoc_too_tall_tac_table_splits_by_rows() {
+        let cells = (0..5u16).map(|r| crate::model::table::Cell {
+            col: 0, row: r, col_span: 1, row_span: 1, width: 51974, height: 16000,
+            paragraphs: vec![Paragraph { text: "가".into(), char_offsets: vec![0],
+                line_segs: vec![LineSeg { line_height: 1200, text_height: 1200, line_spacing: 720, ..Default::default() }],
+                ..Default::default() }],
+            ..Default::default()
+        }).collect();
+        let mut table = crate::model::table::Table { row_count: 5, col_count: 1, cells, page_break: crate::model::table::TablePageBreak::RowBreak, ..Default::default() };
+        table.attr = 0x01;
+        table.common.treat_as_char = true;
+        table.common.width = 51974;
+        table.common.height = 80000; // ≈1067px > A4 본문
+        let paras = vec![
+            make_paragraph_with_height(1500),
+            Paragraph {
+                line_segs: vec![LineSeg { vertical_pos: 1500, line_height: 80000, text_height: 80000, line_spacing: 760, ..Default::default() }],
+                controls: vec![Control::Table(Box::new(table))],
+                ..Default::default()
+            },
+        ];
+        let engine = TypesetEngine::with_default_dpi();
+        let paginator = Paginator::with_default_dpi();
+        let styles = ResolvedStyleSet::default();
+        let composed: Vec<ComposedParagraph> = Vec::new();
+        let (_, measured) = paginator.paginate(&paras, &composed, &styles, &a4_page_def(), &ColumnDef::default(), 0);
+        let r = engine.typeset_section(&paras, &composed, &styles, &a4_page_def(), &ColumnDef::default(), 0, &measured.tables, false, &std::collections::HashSet::new());
+        let items: Vec<&PageItem> = r.pages.iter().flat_map(|p| p.column_contents.iter().flat_map(|c| c.items.iter())).collect();
+        assert!(!items.iter().any(|it| matches!(it, PageItem::Table { para_index: 1, .. })), "빈 쪽보다 큰 TAC 표가 통째 배치됨");
+        assert!(items.iter().any(|it| matches!(it, PageItem::PartialTable { para_index: 1, .. })), "행 분할 경로로 배치돼야 함");
+    }
+
+    /// [genDOC 0050 / BAC-1813] 제목 문단 + 빈 쪽보다 큰 TAC 표: 표를 다음 쪽으로 미리 넘기면 제목만 남은 쪽이 생긴다.
+    /// 제목 바로 아래에서 나뉘어야 한다(공고 7299 신청서, 1623 초안 1쪽).
+    #[test]
+    fn bac1813_too_tall_tac_table_splits_under_heading() {
+        let cells = (0..5u16).map(|r| crate::model::table::Cell {
+            col: 0, row: r, col_span: 1, row_span: 1, width: 51974, height: 16000,
+            paragraphs: vec![Paragraph { text: "가".into(), char_offsets: vec![0],
+                line_segs: vec![LineSeg { line_height: 1200, text_height: 1200, line_spacing: 720, ..Default::default() }],
+                ..Default::default() }],
+            ..Default::default()
+        }).collect();
+        let mut table = crate::model::table::Table { row_count: 5, col_count: 1, cells, page_break: crate::model::table::TablePageBreak::RowBreak, ..Default::default() };
+        table.attr = 0x01;
+        table.common.treat_as_char = true;
+        table.common.width = 51974;
+        table.common.height = 80000;
+        let paras = vec![
+            make_paragraph_with_height(1500),
+            Paragraph {
+                line_segs: vec![LineSeg { vertical_pos: 1500, line_height: 80000, text_height: 80000, line_spacing: 760, ..Default::default() }],
+                controls: vec![Control::Table(Box::new(table))],
+                ..Default::default()
+            },
+        ];
+        let engine = TypesetEngine::with_default_dpi();
+        let paginator = Paginator::with_default_dpi();
+        let styles = ResolvedStyleSet::default();
+        let composed: Vec<ComposedParagraph> = Vec::new();
+        let (_, measured) = paginator.paginate(&paras, &composed, &styles, &a4_page_def(), &ColumnDef::default(), 0);
+        let r = engine.typeset_section(&paras, &composed, &styles, &a4_page_def(), &ColumnDef::default(), 0, &measured.tables, false, &std::collections::HashSet::new());
+        let first: Vec<String> = r.pages[0].column_contents[0].items.iter().map(|it| format!("{:?}", it)).collect();
+        assert!(first.iter().any(|s| s.contains("PartialTable") && s.contains("para_index: 1")), "1쪽에 제목만 남고 표가 다음 쪽으로 밀림: {:?}", first);
+    }
+
     fn make_paragraph_with_height(line_height: i32) -> Paragraph {
         Paragraph {
             line_segs: vec![LineSeg {
