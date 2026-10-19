@@ -5973,6 +5973,30 @@ mod tests {
         }
     }
 
+    /// [genDOC 0066 / BAC-1840] 꽉 찬 쪽 뒤 빈 문단 여럿 + 쪽나누기: 빈 문단만 든 쪽이 생기면 안 된다.
+    #[test]
+    fn bac1840_empty_run_before_page_break_makes_no_blank_page() {
+        let engine = TypesetEngine::with_default_dpi();
+        let styles = ResolvedStyleSet::default();
+        let text_para = |h: i32| { let mut p = make_paragraph_with_height(h); p.text = "가".to_string(); p };
+        let mut paras: Vec<Paragraph> = (0..12).map(|_| text_para(5000)).collect();
+        paras.extend((0..7).map(|_| Paragraph {
+            line_segs: vec![LineSeg { line_height: 900, line_spacing: 540, ..Default::default() }],
+            ..Default::default()
+        }));
+        let mut brk = text_para(2000);
+        brk.column_type = ColumnBreakType::Page;
+        paras.push(brk);
+        let composed: Vec<ComposedParagraph> = Vec::new();
+        let result = engine.typeset_section(
+            &paras, &composed, &styles, &a4_page_def(), &ColumnDef::default(), 0, &[], false,
+            &std::collections::HashSet::new(),
+        );
+        let blank = result.pages.iter().position(|pg| pg.column_contents.iter().all(|c| c.items.iter().all(|it|
+            matches!(it, PageItem::FullParagraph { para_index, .. } if paras[*para_index].text.is_empty()))));
+        assert!(blank.is_none(), "빈 문단만 든 쪽: {:?} / pages={}", blank, result.pages.len());
+    }
+
     #[test]
     fn composed_footnote_height_separates_body_exact_metric_from_table_queue_floor() {
         let dpi = 96.0;

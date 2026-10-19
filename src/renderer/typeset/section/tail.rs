@@ -311,9 +311,20 @@ impl TypesetEngine {
             // (hwp-multi-001 회귀 차단). 본 추가 가드는 빈 paragraph + 다음 쪽나누기
             // case 중에서 **현재 page 잔여 공간 부족 (overflow) 시에만** skip — 빈
             // paragraph 가 page 에 fit 하면 정상 emit (aift.hwp 의 18 case 회귀 방지).
-            let next_para = &paragraphs[para_idx + 1];
-            let next_force_break = next_para.column_type == ColumnBreakType::Page
-                || next_para.column_type == ColumnBreakType::Section;
+            // [genDOC patch 0066 / BAC-1840] 쪽나누기 바로 앞 1개만이 아니라, 쪽나누기까지 빈 문단만 이어지는
+            // 줄 전체에 같은 규칙을 적용한다. 앞 쪽이 꽉 찬 상태에서 빈 문단 여럿이 넘치면 빈 문단만 든 쪽이
+            // 생긴다(공고 660: 글자처럼 그림 높이를 세자 pi=28~33 이 넘침). 흡수 조건(#7429: 저장 줄일 때만)은 그대로다.
+            let next_force_break = paragraphs[para_idx + 1..]
+                .iter()
+                .find(|p| {
+                    p.column_type == ColumnBreakType::Page
+                        || p.column_type == ColumnBreakType::Section
+                        || !(p.text.is_empty() && p.controls.is_empty())
+                })
+                .is_some_and(|p| {
+                    p.column_type == ColumnBreakType::Page
+                        || p.column_type == ColumnBreakType::Section
+                });
             let is_curr_empty = para.text.is_empty() && para.controls.is_empty();
             // [#7429] 흡수는 **문서가 적어 둔 배치**일 때만 한다.
             //
