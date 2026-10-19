@@ -376,7 +376,110 @@ function reportSaveError(scope: string, error: unknown): void {
 
 export type SaveCurrentDocumentResult = 'saved' | 'cancelled' | 'failed' | 'unsupported';
 
+/* ── genDOC host integration (patched) ──────────────────────────────
+ * genDOC 안에 iframe(`?host=gendoc`)으로 임베드되면 저장은 로컬 파일 다운로드가
+ * 아니라 호스트(genDOC 계정 DB)로 간다. 스탠드얼론 동작은 그대로 보존한다.
+ * 부모↔iframe 계약: 아웃바운드 `gendoc:rhwp:save`{requestId,bytes,fileName,sourceFormat}
+ * → 인바운드 `gendoc:rhwp:save:ack`{requestId,ok,fileName?,error?,cancelled?}.
+ * HWPX 소스는 exportHwpx 로 HWPX 패키지 그대로 저장한다. */
+function isGenDocHostMode(): boolean {
+  try {
+    return typeof window !== 'undefined'
+      && window.parent !== window
+      && new URLSearchParams(window.location.search).get('host') === 'gendoc';
+  } catch {
+    return false;
+  }
+}
+
+// 알려진 문서 확장자만 제거한다. 임의 꼬리를 확장자로 오인하는 폴백(\.[^/.]+$)은
+// "2. 참가신청서(...)_260526" 같은 공고 양식 제목을 "2"로 잘라버린다 (grants 2404 사건).
+const GENDOC_DOC_EXT_RE = /\.(hwpx?|docx?|pdf|txt)$/i;
+
+function genDocSaveFileName(fileName: string, sourceFormat: string): string {
+  const ext = sourceFormat === 'hwpx' ? 'hwpx' : 'hwp';
+  const base =
+    (fileName || 'document').replace(GENDOC_DOC_EXT_RE, '').replace(GENDOC_DOC_EXT_RE, '').trim() ||
+    'document';
+  return `${base}.${ext}`;
+}
+
+/* [genDOC BAC-507] 호스트 임베드에서 로컬 HWP 다운로드('다른 이름으로 저장') 허용 여부.
+ * export 가능 플랜이면 호스트(RhwpStudioClient)가 iframe URL에 export=1 을 붙여 내려보낸다.
+ * 호스트의 CSS 숨김(FE-637)과 별개로 커맨드 레벨에서 단축키(Ctrl+Shift+S)·커맨드 팔레트
+ * 경로까지 막는 패치 레벨 게이트. 스탠드얼론(비 host 모드)은 항상 허용. */
+function isGenDocExportAllowed(): boolean {
+  try {
+    return new URLSearchParams(window.location.search).get('export') === '1';
+  } catch {
+    return false;
+  }
+}
+
+/* [genDOC BAC-507] host 모드에서 export 미허용이면 로컬 내보내기 명령(다른 이름 저장·HWP/HWPX로 저장·
+ * PDF·HTML·DOC 내보내기)을 모두 비활성. 스탠드얼론(비 host 모드)은 항상 허용. */
+function isGenDocExportAllowedInHost(): boolean {
+  return !isGenDocHostMode() || isGenDocExportAllowed();
+}
+
+let genDocSaveSeq = 0;
+function saveCurrentDocumentToGenDocHost(
+  services: CommandServices,
+): Promise<SaveCurrentDocumentResult> {
+  return new Promise((resolve) => {
+    let bytes: Uint8Array;
+    let sourceFormat = 'hwp';
+    try {
+      // v0.8.7: 셀 편집은 페이지네이션을 미룰 수 있다 — 로컬 저장과 같이 출력 전에 확정한다.
+      flushDeferredPaginationBeforeExplicitOutput(services, 'save');
+      // [genDOC BAC-1856] 셀을 채워 늘어난 표 높이를 저장본에 되쓴다 — v0.8.7 은 다시 열 때 저장 조판을 믿는다.
+      services.wasm.syncGrownTableFrames();
+      sourceFormat = services.wasm.getSourceFormat();
+      bytes = sourceFormat === 'hwpx' ? services.wasm.exportHwpx() : services.wasm.exportHwp();
+    } catch (e) {
+      console.error('[file:save→gendoc] export 실패:', e);
+      // [genDOC BAC-514] 직렬화 실패를 호스트에 알린다. 종전엔 여기서 조용히 끝나
+      // 호스트가 "변경됨" 상태로 영원히 대기했다(triggerSave RPC는 dispatch만 하고 ok 응답).
+      window.parent.postMessage({ type: 'gendoc:rhwp:save:failed', error: String(e) }, '*');
+      resolve('failed');
+      return;
+    }
+    const requestId = `save-${++genDocSaveSeq}-${Date.now()}`;
+    const fileName = genDocSaveFileName(services.wasm.fileName, sourceFormat);
+    let settled = false;
+    const finish = (result: SaveCurrentDocumentResult) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('message', onAck);
+      resolve(result);
+    };
+    function onAck(e: MessageEvent): void {
+      const m = e.data;
+      if (!m || m.type !== 'gendoc:rhwp:save:ack' || m.requestId !== requestId) return;
+      if (m.ok) {
+        if (typeof m.fileName === 'string') services.wasm.fileName = m.fileName;
+        services.documentState.markClean('save');
+        console.log(`[file:save→gendoc] saved (${(bytes.length / 1024).toFixed(1)}KB)`);
+        finish('saved');
+      } else {
+        if (m.error) console.error('[file:save→gendoc] 호스트 저장 실패:', m.error);
+        finish(m.cancelled ? 'cancelled' : 'failed');
+      }
+    }
+    window.addEventListener('message', onAck);
+    window.parent.postMessage(
+      { type: 'gendoc:rhwp:save', requestId, bytes, fileName, sourceFormat },
+      '*',
+    );
+    // 호스트 무응답 안전장치
+    setTimeout(() => finish('failed'), 30000);
+  });
+}
+
 export async function saveCurrentDocument(services: CommandServices): Promise<SaveCurrentDocumentResult> {
+  if (isGenDocHostMode()) {
+    return saveCurrentDocumentToGenDocHost(services);
+  }
   let password: string | null = null;
   try {
     flushDeferredPaginationBeforeExplicitOutput(services, 'save');
@@ -809,8 +912,9 @@ export const fileCommands: CommandDef[] = [
     id: 'file:save-as',
     label: t('command.file.saveAs.registryLabel'),
     shortcutLabel: 'Ctrl+Shift+S',
-    canExecute: (ctx) => ctx.hasDocument,
+    canExecute: (ctx) => ctx.hasDocument && isGenDocExportAllowedInHost(),
     async execute(services) {
+      if (!isGenDocExportAllowedInHost()) return; // [genDOC BAC-507] 방어선 2중화
       const format = await chooseSaveAsFormat(services);
       if (format !== null) await saveAsFormat(services, format);
     },
@@ -819,8 +923,9 @@ export const fileCommands: CommandDef[] = [
     // [#1613] HWP 형식으로 저장 — 출처 무관 HWP 출력.
     id: 'file:save-as-hwp',
     label: t('command.file.saveAsHwp.registryLabel'),
-    canExecute: (ctx) => ctx.hasDocument,
+    canExecute: (ctx) => ctx.hasDocument && isGenDocExportAllowedInHost(),
     async execute(services) {
+      if (!isGenDocExportAllowedInHost()) return; // [genDOC BAC-507] 방어선 2중화
       await saveAsFormat(services, 'hwp');
     },
   },
@@ -828,8 +933,9 @@ export const fileCommands: CommandDef[] = [
     // [#1613] HWPX 형식으로 저장 — 출처 무관 HWPX 출력.
     id: 'file:save-as-hwpx',
     label: t('command.file.saveAsHwpx.registryLabel'),
-    canExecute: (ctx) => ctx.hasDocument,
+    canExecute: (ctx) => ctx.hasDocument && isGenDocExportAllowedInHost(),
     async execute(services) {
+      if (!isGenDocExportAllowedInHost()) return; // [genDOC BAC-507] 방어선 2중화
       await saveAsFormat(services, 'hwpx');
     },
   },
@@ -848,8 +954,9 @@ export const fileCommands: CommandDef[] = [
   {
     id: 'file:print-to-pdf',
     label: t('command.file.printToPdf.label'),
-    canExecute: (ctx) => ctx.hasDocument,
+    canExecute: (ctx) => ctx.hasDocument && isGenDocExportAllowedInHost(),
     async execute(services) {
+      if (!isGenDocExportAllowedInHost()) return; // [genDOC BAC-507] 방어선 2중화
       await runPdfPrint(services);
     },
   },
@@ -857,8 +964,9 @@ export const fileCommands: CommandDef[] = [
     // 문서 전체를 selection HTML 조립 기반의 단일 HTML 파일로 내보낸다.
     id: 'file:export-html',
     label: t('command.file.exportHtml.label'),
-    canExecute: (ctx) => ctx.hasDocument,
+    canExecute: (ctx) => ctx.hasDocument && isGenDocExportAllowedInHost(),
     execute(services) {
+      if (!isGenDocExportAllowedInHost()) return; // [genDOC BAC-507] 방어선 2중화
       exportHtmlBasedFile(services, 'html');
     },
   },
@@ -866,8 +974,9 @@ export const fileCommands: CommandDef[] = [
     // Word 가 여는 HTML 기반 .doc 문서로 내보낸다 (OOXML 아님).
     id: 'file:export-doc',
     label: t('command.file.exportDoc.label'),
-    canExecute: (ctx) => ctx.hasDocument,
+    canExecute: (ctx) => ctx.hasDocument && isGenDocExportAllowedInHost(),
     execute(services) {
+      if (!isGenDocExportAllowedInHost()) return; // [genDOC BAC-507] 방어선 2중화
       exportHtmlBasedFile(services, 'doc');
     },
   },
