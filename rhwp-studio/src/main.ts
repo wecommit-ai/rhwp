@@ -1993,6 +1993,698 @@ function showLoadError(error: unknown): void {
   });
 }
 
+
+// ── [genDOC host integration] 호스트 확장 RPC ──────────────────────────────
+// 옛 main.ts `window 'message'` 핸들러의 genDOC case들(patch 0002~0043·0048)을 그대로 옮겼다.
+// v0.8.7부터 메시지 수신은 embed/runtime.ts(옛 rhwp-request 형식은 handleLegacy)가 맡고,
+// upstream router가 모르는 method만 여기로 온다(rpc-router.ts `handlers.gendoc`).
+// case 본문의 `reply(result, error)` 계약은 옛 핸들러와 같다 — 첫 reply가 응답이 된다.
+function isGenDocHostMode(): boolean {
+  try {
+    return window.parent !== window
+      && new URLSearchParams(window.location.search).get('host') === 'gendoc';
+  } catch {
+    return false;
+  }
+}
+
+function genDocRpc(method: string, params: any): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const reply = (result?: any, error?: string) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(new Error(error)); else resolve(result);
+    };
+    (async () => {
+    switch (method) {
+      // [genDOC host integration] 빈 새 문서 생성 (호스트의 "새 문서" 진입점).
+      case 'newDocument':
+        await initPromise;
+        if (!await canReplaceCurrentDocument(Boolean(params?.skipUnsavedGuard))) {
+          reply(undefined, '문서 생성이 취소되었습니다.');
+          break;
+        }
+        await createNewDocument();
+        reply({ pageCount: wasm.pageCount });
+        break;
+      // [genDOC host integration] AI 어댑터: 커서 주변 문맥 읽기 + 커서에 삽입.
+      case 'getContextText': {
+        await initPromise;
+        try {
+          const pos = wasm.getCaretPosition();
+          if (!pos) { reply({ text: '' }); break; }
+          const t = wasm.getTextRange(pos.sectionIndex, pos.paragraphIndex, 0, 4000);
+          reply({ text: t ?? '' });
+        } catch {
+          reply({ text: '' });
+        }
+        break;
+      }
+      case 'insertText':
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        inputHandler.insertPlainTextAtCursor(String(params?.text ?? ''));
+        reply({ ok: true });
+        break;
+      // [genDOC host integration] 현재 선택 영역의 평문 (임원진 토의 대상). 선택 없으면 ''.
+      // [genDOC BAC-506] 표 셀 선택도 인식: ① 셀 범위 선택 모드 → 셀별 텍스트(같은 행=탭, 행 간=개행),
+      // ② 셀 내부 텍스트 선택 → copySelectionInCell, ③ 본문 선택 → 기존 copySelection 그대로.
+      // 응답 shape({text})는 유지 — 호스트(unwrapEngineText)는 JSON·평문 모두 언랩한다.
+      case 'getSelectionText': {
+        await initPromise;
+        try {
+          const cellModeText = inputHandler?.getCellSelectionPlainText() ?? '';
+          if (cellModeText) { reply({ text: cellModeText }); break; }
+          const sel = inputHandler?.getSelection();
+          if (!sel) { reply({ text: '' }); break; }
+          const { start, end } = sel;
+          if (start.parentParaIndex !== undefined) {
+            const sameTable = end.parentParaIndex === start.parentParaIndex
+              && end.controlIndex === start.controlIndex;
+            if (sameTable && end.cellIndex === start.cellIndex) {
+              // 같은 셀 안의 텍스트 선택(드래그의 기본 동작 — 드래그는 셀을 벗어나지 않는다)
+              const t = wasm.copySelectionInCell(
+                start.sectionIndex, start.parentParaIndex, start.controlIndex!, start.cellIndex!,
+                start.cellParaIndex ?? 0, start.charOffset,
+                end.cellParaIndex ?? 0, end.charOffset,
+              );
+              reply({ text: t ?? '' });
+              break;
+            }
+            if (sameTable && start.cellIndex !== undefined && end.cellIndex !== undefined) {
+              // 같은 표의 셀 횡단 선택(키보드 확장 등): 셀별 전체 텍스트를 탭으로 연결
+              const cells: string[] = [];
+              for (let cidx = start.cellIndex; cidx <= end.cellIndex; cidx++) {
+                cells.push(inputHandler!.getCellPlainText(
+                  start.sectionIndex, start.parentParaIndex, start.controlIndex!, cidx,
+                ));
+              }
+              reply({ text: cells.filter(Boolean).join('\t') });
+              break;
+            }
+            reply({ text: '' });
+            break;
+          }
+          const t = wasm.copySelection(
+            start.sectionIndex, start.paragraphIndex, start.charOffset,
+            end.paragraphIndex, end.charOffset,
+          );
+          reply({ text: t ?? '' });
+        } catch {
+          reply({ text: '' });
+        }
+        break;
+      }
+      // [genDOC BAC-414] 현재 선택 영역의 위치(start/end DocumentPosition). 채택 시 그 범위를 교체하기
+      // 위해 호스트(AI 챗·임원진 토의)가 *생성 시점*에 미리 잡아둔다. 선택 없으면 null.
+      case 'getSelectionRange': {
+        await initPromise;
+        try {
+          const sel = inputHandler?.getSelection();
+          reply({ range: sel ?? null });
+        } catch {
+          reply({ range: null });
+        }
+        break;
+      }
+      // [genDOC BAC-414] 주어진 범위(start..end)를 새 평문으로 *교체*한다(기존 내용 삭제 후 삽입).
+      // 채택 시점에 엔진 선택이 풀려 있어도 append되지 않게, 저장해둔 범위로 결정적으로 교체한다.
+      case 'replaceRange': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const r = params?.range as { start?: any; end?: any } | undefined;
+        const ok = r?.start && r?.end
+          ? inputHandler.replaceRangeWithText(r.start, r.end, String(params?.text ?? ''))
+          : (inputHandler.insertPlainTextAtCursor(String(params?.text ?? '')), true);
+        reply({ ok });
+        break;
+      }
+      // [genDOC BAC-433] 주어진 범위(start..end)를 편집 없이 선택·스크롤한다. AI 검토 카드의
+      // "본문에서 보기"가 제안 대상 위치를 본문에서 하이라이트하는 용도. range는 findText 매치로 구성.
+      case 'selectRange': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const sr = params?.range as { start?: any; end?: any } | undefined;
+        const ok = sr?.start && sr?.end ? inputHandler.selectRange(sr.start, sr.end) : false;
+        reply({ ok });
+        break;
+      }
+      // [genDOC FE-609] 코멘트 앵커 하이라이트(노란 상시 오버레이) 목록 교체. items 는 호스트가
+      // snippet 을 findText 로 재앵커한 매치 좌표 {id, sec, para, charOffset, length, cellContext?}.
+      // [genDOC BAC-701] 출처 인용 클릭 링크 목록 등록/교체. 항목은 findText 매치 좌표 + url.
+      // [genDOC BAC-701/patch 0036] 본문 텍스트 범위에 실제 HWP 하이퍼링크 필드 삽입 —
+      // 저장된 .hwp 를 한컴에서 열어도 클릭 가능한 필드가 남는다(FIELD_BEGIN/END 쌍).
+      case 'applyHyperlinkRange': {
+        await initPromise;
+        try {
+          const url = String(params?.url ?? '');
+          if (!/^https?:\/\//.test(url)) { reply({ ok: false }); break; }
+          // [v0.8.7] upstream 하이퍼링크 필드 API(#7318, insertHyperlinkEx)로 대체 — patch 0039 Rust 부분 삭제.
+          wasm.insertHyperlink(
+            { section: Number(params?.sec ?? 0), para: Number(params?.para ?? 0), cellPath: [] },
+            Number(params?.startChar ?? 0),
+            Number(params?.endChar ?? 0),
+            url,
+          );
+          reply({ ok: true });
+        } catch (e: any) {
+          reply({ ok: false, error: e?.message || String(e) });
+        }
+        break;
+      }
+      // [genDOC BAC-701/patch 0036] 등록된 출처 링크의 페이지 좌표 사각형 — PDF 링크 주석용.
+      case 'getCitationLinkRects': {
+        await initPromise;
+        if (!inputHandler) { reply({ links: [] }); break; }
+        try {
+          reply({ links: inputHandler.getCitationLinkRects() });
+        } catch {
+          reply({ links: [] });
+        }
+        break;
+      }
+      case 'setCitationLinks': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const linkItems = Array.isArray(params?.items) ? params.items : [];
+        reply({ ok: true, count: inputHandler.setCitationLinks(linkItems) });
+        break;
+      }
+      case 'setCommentHighlights': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const items = Array.isArray(params?.items) ? params.items : [];
+        reply({ ok: true, count: inputHandler.setCommentHighlights(items) });
+        break;
+      }
+      // [genDOC FE-609] 코멘트 카드 클릭 → 해당 하이라이트로 스크롤 + 플래시. 하이라이트가
+      // 없으면(좌표 무효 등) ok:false — 호스트가 findText 재앵커 폴백을 탄다.
+      case 'focusCommentHighlight': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        reply({ ok: inputHandler.focusCommentHighlight(String(params?.id ?? '')) });
+        break;
+      }
+      // [genDOC BAC-840] 검토(첨삭) 앵커 하이라이트(코멘트와 독립된 인디고 오버레이) 목록 교체.
+      // items 는 호스트가 snippet 을 findText 로 재앵커한 매치 좌표 {id, sec, para, charOffset, length, color?, cellContext?}.
+      case 'setReviewHighlights': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const items = Array.isArray(params?.items) ? params.items : [];
+        reply({ ok: true, count: inputHandler.setReviewHighlights(items) });
+        break;
+      }
+      // [genDOC BAC-840] 검토 카드 클릭 → 해당 하이라이트로 스크롤 + 플래시. 없으면 ok:false.
+      case 'focusReviewHighlight': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        reply({ ok: inputHandler.focusReviewHighlight(String(params?.id ?? '')) });
+        break;
+      }
+      // [genDOC FE-598/721] 주어진 본문/표 셀 위치의 캐럿을 viewport 좌표로 반환(편집/스크롤 없음).
+      // 호스트가 원격 협업자 커서를 iframe 위에 계정별 색 오버레이로 그리는 용도.
+      case 'getCaretClientRect': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const cp = params?.pos as {
+          sec?: number; para?: number; charOffset?: number;
+          sectionIndex?: number; paragraphIndex?: number;
+          parentPara?: number; parentParaIndex?: number;
+          ctrlIdx?: number; controlIndex?: number;
+          cellIdx?: number; cellIndex?: number;
+          cellParaIdx?: number; cellParaIndex?: number;
+        } | undefined;
+        const sec = cp?.sectionIndex ?? cp?.sec;
+        const parentPara = cp?.parentParaIndex ?? cp?.parentPara;
+        const ctrlIdx = cp?.controlIndex ?? cp?.ctrlIdx;
+        const cellIdx = cp?.cellIndex ?? cp?.cellIdx;
+        const cellParaIdx = cp?.cellParaIndex ?? cp?.cellParaIdx ?? 0;
+        const rect =
+          sec !== undefined && parentPara !== undefined && ctrlIdx !== undefined && cellIdx !== undefined
+            ? inputHandler.getCaretClientRectInCell(sec, parentPara, ctrlIdx, cellIdx, cellParaIdx, cp?.charOffset ?? 0)
+            : sec !== undefined && (cp?.paragraphIndex ?? cp?.para) !== undefined
+              ? inputHandler.getCaretClientRect(sec, (cp?.paragraphIndex ?? cp?.para)!, cp?.charOffset ?? 0)
+              : null;
+        reply({ rect });
+        break;
+      }
+      // [genDOC FE-721] 원격 협업자 선택 범위를 줄별 viewport rect 로 반환(편집/스크롤 없음).
+      // 호스트는 이 rect 들을 iframe 위 오버레이로 그려 여러 줄 드래그 선택까지 표시한다.
+      case 'getSelectionClientRects': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const sr = params?.range as { start?: any; end?: any } | undefined;
+        const rects = sr?.start && sr?.end
+          ? inputHandler.getSelectionClientRects(sr.start, sr.end)
+          : [];
+        reply({ rects });
+        break;
+      }
+      // [genDOC FE-600] 현재 캐럿 위치(collapsed 포함) 반환 — 원격 협업자 커서 송신용.
+      case 'getCaretPosition': {
+        await initPromise;
+        if (!inputHandler) { reply({ pos: null }); break; }
+        reply({ pos: inputHandler.getCaretPosition() });
+        break;
+      }
+      // [genDOC BAC-448] 주어진 범위(start..end)의 글자 서식만 변경한다(텍스트 불변).
+      // AI 채움·교체의 인라인 트랙체인지 표시용(기존=빨강+취소선, 신규=초록). props 는
+      // applyCharFormat 스키마({ textColor, strikethrough, ... }). 객체/문자열 모두 허용.
+      case 'formatRange': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const fr = params?.range as { start?: any; end?: any } | undefined;
+        const props = typeof params?.props === 'string' ? params.props : JSON.stringify(params?.props ?? {});
+        const ok = fr?.start && fr?.end ? inputHandler.formatRange(fr.start, fr.end, props) : false;
+        reply({ ok });
+        break;
+      }
+      // [genDOC BAC-460] 표 셀로 스크롤(편집 없이). AI 검토 "본문에서 보기"가 표 셀 제안을 클릭한 경우.
+      case 'scrollToCell': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const ok = inputHandler.scrollToCell(
+          Number(params?.sec ?? 0),
+          Number(params?.parentPara ?? 0),
+          Number(params?.ctrlIdx ?? 0),
+          Number(params?.cellIdx ?? 0),
+          Number(params?.cellPara ?? 0),
+          Number(params?.charOffset ?? 0),
+        );
+        reply({ ok });
+        break;
+      }
+      // [genDOC BAC-460+] 표 셀 내부 범위의 글자 서식만 변경(텍스트 불변) — 셀 인라인 트랙체인지.
+      case 'formatRangeInCell': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const r = params?.range as { startCellPara?: number; startOffset?: number; endCellPara?: number; endOffset?: number } | undefined;
+        const props = typeof params?.props === 'string' ? params.props : JSON.stringify(params?.props ?? {});
+        const ok = inputHandler.formatRangeInCell(
+          Number(params?.sec ?? 0), Number(params?.parentPara ?? 0), Number(params?.ctrlIdx ?? 0), Number(params?.cellIdx ?? 0),
+          Number(r?.startCellPara ?? 0), Number(r?.startOffset ?? 0), Number(r?.endCellPara ?? 0), Number(r?.endOffset ?? 0), props,
+        );
+        reply({ ok });
+        break;
+      }
+      // [genDOC BAC-460+] 표 셀 내부 범위 텍스트 삭제 — 셀 인라인 미리보기 확정/취소 시.
+      case 'deleteRangeInCell': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const ok = inputHandler.deleteRangeInCell(
+          Number(params?.sec ?? 0), Number(params?.parentPara ?? 0), Number(params?.ctrlIdx ?? 0), Number(params?.cellIdx ?? 0),
+          Number(params?.cellPara ?? 0), Number(params?.startOffset ?? 0), Number(params?.length ?? 0),
+        );
+        reply({ ok });
+        break;
+      }
+      // [genDOC BAC-460+] 스크롤 위치 읽기/복원 — 편집 후 reflow의 맨위 리셋 상쇄(변경/유지 후 뷰 고정).
+      case 'getScrollTop': {
+        await initPromise;
+        reply({ scrollTop: inputHandler ? inputHandler.getScrollTop() : 0 });
+        break;
+      }
+      case 'setScrollTop': {
+        await initPromise;
+        if (inputHandler) inputHandler.setScrollTop(Number(params?.y ?? 0));
+        reply({ ok: true });
+        break;
+      }
+      // [genDOC BAC-507] 현재 커서(본문) 위치에 rows×cols 표 삽입. 성공 시 표 좌표와 셀 그리드
+      // (cellIdx↔row/col)를 반환 — 호스트가 insertTextInCellAt(cellfill)로 값을 채운다.
+      // 표 셀 안 커서 등 삽입 불가면 {ok:false} — 호스트는 텍스트 블록 인터림으로 폴백.
+      case 'insertTable': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const tRows = Math.max(1, Math.min(64, Math.trunc(Number(params?.rows ?? 0)) || 0));
+        const tCols = Math.max(1, Math.min(16, Math.trunc(Number(params?.cols ?? 0)) || 0));
+        const tableRef = inputHandler.insertTableAtCursor(tRows, tCols);
+        reply(tableRef ? { ok: true, ...tableRef } : { ok: false });
+        break;
+      }
+      // [genDOC host integration] 위치지정 자동채움: 양식 제목을 검색해 그 위치에 섹션 본문을 넣는다.
+      // findText → 매치 목록(본문/셀 위치), insertTextAt → 본문 문단 지정 위치에 삽입(재렌더+undo 경유).
+      case 'findText': {
+        await initPromise;
+        try {
+          // WasmBridge.searchAllText 는 이미 SearchHit[] 로 파싱해 반환한다(문자열 아님).
+          const matches = wasm.searchAllText(
+            String(params?.query ?? ''),
+            Boolean(params?.caseSensitive),
+            params?.includeCells !== false,
+          );
+          reply({ matches });
+        } catch {
+          reply({ matches: [] });
+        }
+        break;
+      }
+      case 'insertTextAt': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const end = inputHandler.insertTextAtPosition(
+          Number(params?.sec ?? 0),
+          Number(params?.para ?? 0),
+          Number(params?.charOffset ?? 0),
+          String(params?.text ?? ''),
+          // [genDOC patch 0031] 삽입 텍스트 크기(1/100pt) — 문서 본문체 통일용. 미지정 시 기존 정책.
+          typeof params?.fontSize === 'number' ? params.fontSize : undefined,
+          // [genDOC patch 0043 / BAC-865 ①] true면 그 본문 문단을 비우고 채운다(양식 시드 마커 제거).
+          Boolean(params?.replace),
+        );
+        // end=삽입 끝 위치(호스트 스트리밍 연속 삽입용), null이면 위치 무효.
+        reply({ ok: !!end, end });
+        break;
+      }
+      // [genDOC patch 0031] 본문 대표 글자 크기 통계(읽기 전용) — autoDraft 가 삽입 크기를 정할 때 씀.
+      case 'getBodyFontSizeStats': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        try {
+          reply(inputHandler.getBodyFontSizeStats());
+        } catch (e: any) {
+          reply(undefined, e?.message || String(e));
+        }
+        break;
+      }
+      // [genDOC host integration] 양식 골격 스캔(form-driven 채움): 본문 문단 + 표 셀(빈 셀 포함)을
+      // 좌표·텍스트와 함께 한 번에 읽는다. 호스트가 라벨/안내를 보고 칸별 내용을 생성해 제자리에 채운다.
+      case 'getFormSkeleton': {
+        await initPromise;
+        try {
+          const regions: any[] = [];
+          const secCount = wasm.getSectionCount();
+          for (let s = 0; s < secCount; s++) {
+            const pCount = wasm.getParagraphCount(s);
+            for (let p = 0; p < pCount; p++) {
+              // 이 문단의 표 컨트롤 탐지(ctrlIdx 0..4 probe — 비표/범위초과는 throw).
+              for (let c = 0; c < 5; c++) {
+                // WasmBridge.getTableDimensions 는 이미 객체로 파싱해 반환(비표면 throw).
+                let dims: { rowCount: number; colCount: number; cellCount: number };
+                try {
+                  dims = wasm.getTableDimensions(s, p, c);
+                } catch {
+                  continue;
+                }
+                if (!dims || typeof dims.cellCount !== 'number') continue;
+                const cells: any[] = [];
+                for (let ci = 0; ci < dims.cellCount; ci++) {
+                  let row = -1, col = -1, rowSpan = 1, colSpan = 1, hasObject = false;
+                  try {
+                    const info = wasm.getCellInfo(s, p, c, ci); // 이미 파싱된 CellInfo
+                    row = info.row; col = info.col;
+                    rowSpan = (info as { rowSpan?: number }).rowSpan ?? 1; // [genDOC BAC-434] 병합폭 — grid 열/행 정렬용(병합 행에서 열인덱스 시프트 보정)
+                    colSpan = (info as { colSpan?: number }).colSpan ?? 1;
+                    hasObject = (info as { hasObject?: boolean }).hasObject === true; // 셀 내 개체(텍스트박스 등)
+                  } catch { /* 좌표 못 읽으면 -1 */ }
+                  let cpc = 0;
+                  try { cpc = wasm.getCellParagraphCount(s, p, c, ci); } catch { /* 0 */ }
+                  let text = '';
+                  for (let cp = 0; cp < cpc; cp++) {
+                    try { text += (wasm.getTextInCell(s, p, c, ci, cp, 0, 400) ?? '') + (cp < cpc - 1 ? '\n' : ''); } catch { /* skip */ }
+                  }
+                  // 첫 글자 색 — 검정=라벨/헤더(유지), 파랑/초록/빨강=예시 placeholder(교체 대상).
+                  // [genDOC patch 0043 / BAC-865] 기울임도 함께 노출한다 — 양식 설계자는 placeholder 에
+                  // 파란색과 기울임을 같이 준다. 둘을 합치면 "채울 칸" 판별이 추론이 아니라 원본 데이터가 된다.
+                  let color = '', italic = false;
+                  try {
+                    const cprops = wasm.getCellCharPropertiesAt(s, p, c, ci, 0, 0);
+                    color = (cprops.textColor ?? '').toLowerCase();
+                    italic = cprops.italic === true;
+                  } catch { /* 서식 못 읽으면 빈 값 */ }
+                  // [genDOC] 중첩 표 탐색: 셀 안에 표(개체)가 있으면 그 안쪽 표의 셀들을
+                  // path 좌표와 함께 평면화해 노출한다(요약표·산출물 값칸이 여기 잡힘).
+                  // 깊이 1단계(=path 길이 2)까지만 — PSST 양식은 그 이상 중첩되지 않는다.
+                  const nested: any[] = [];
+                  if (hasObject) {
+                    for (let outerCp = 0; outerCp < cpc; outerCp++) {
+                      for (let innerCtrl = 0; innerCtrl < 5; innerCtrl++) {
+                        const pathJson = JSON.stringify([
+                          { controlIndex: c, cellIndex: ci, cellParaIndex: outerCp },
+                          { controlIndex: innerCtrl, cellIndex: 0, cellParaIndex: 0 },
+                        ]);
+                        let innerDims: { rowCount: number; colCount: number; cellCount: number } | null = null;
+                        try { innerDims = wasm.getTableDimensionsByPath(s, p, pathJson); } catch { continue; }
+                        if (!innerDims || typeof innerDims.cellCount !== 'number') continue;
+                        for (let ici = 0; ici < innerDims.cellCount; ici++) {
+                          const cellPathJson = JSON.stringify([
+                            { controlIndex: c, cellIndex: ci, cellParaIndex: outerCp },
+                            { controlIndex: innerCtrl, cellIndex: ici, cellParaIndex: 0 },
+                          ]);
+                          let irow = -1, icol = -1, irowSpan = 1, icolSpan = 1, iHasObject = false;
+                          try {
+                            const info = wasm.getCellInfoByPath(s, p, cellPathJson);
+                            irow = (info as { row: number }).row;
+                            icol = (info as { col: number }).col;
+                            irowSpan = (info as { rowSpan?: number }).rowSpan ?? 1; // [genDOC BAC-434] 병합폭
+                            icolSpan = (info as { colSpan?: number }).colSpan ?? 1;
+                            iHasObject = (info as { hasObject?: boolean }).hasObject === true;
+                          } catch { /* skip */ }
+                          let icpc = 0;
+                          try { icpc = wasm.getCellParagraphCountByPath(s, p, cellPathJson); } catch { /* 0 */ }
+                          let itext = '';
+                          for (let cp = 0; cp < icpc; cp++) {
+                            const cpPath = JSON.stringify([
+                              { controlIndex: c, cellIndex: ci, cellParaIndex: outerCp },
+                              { controlIndex: innerCtrl, cellIndex: ici, cellParaIndex: cp },
+                            ]);
+                            try { itext += (wasm.getTextInCellByPath(s, p, cpPath, 0, 400) ?? '') + (cp < icpc - 1 ? '\n' : ''); } catch { /* skip */ }
+                          }
+                          nested.push({
+                            cellIdx: ici, row: irow, col: icol, rowSpan: irowSpan, colSpan: icolSpan, paraCount: icpc,
+                            text: itext.trim(), hasObject: iHasObject,
+                            // 평면화된 path: [(c,ci,outerCp),(innerCtrl,ici,0)] — autoDraft 가 그대로 RPC에 넘김.
+                            path: [
+                              { controlIndex: c, cellIndex: ci, cellParaIndex: outerCp },
+                              { controlIndex: innerCtrl, cellIndex: ici, cellParaIndex: 0 },
+                            ],
+                          });
+                        }
+                      }
+                    }
+                  }
+                  cells.push({ cellIdx: ci, row, col, rowSpan, colSpan, paraCount: cpc, text: text.trim(), hasObject, color, italic, nested: nested.length ? nested : undefined });
+                }
+                regions.push({ kind: 'table', sec: s, para: p, ctrlIdx: c, rows: dims.rowCount, cols: dims.colCount, cells });
+              }
+              // 본문 문단 텍스트(맥락·앵커용).
+              const text = (wasm.getTextRange(s, p, 0, 400) ?? '').trim();
+              // [genDOC patch 0043 / BAC-865] 본문 문단도 첫 글자 서식을 노출한다. 양식의 placeholder 는
+              // 전부 파란색(#0000ff)+기울임이고 실제 라벨·안내문은 검정이라, 이게 "여기 채우세요"의
+              // 원본 표식이다. 서술 항목(문제인식·실현가능성·성장전략·팀구성)은 표가 아니라 본문
+              // 문단이라 셀 색만 노출해서는 작성 표면의 다수가 판별 불가로 남는다.
+              let bColor = '', bItalic = false;
+              try {
+                const bprops = wasm.getCharPropertiesAt(s, p, 0);
+                bColor = (bprops.textColor ?? '').toLowerCase();
+                bItalic = bprops.italic === true;
+              } catch { /* 서식 못 읽으면 빈 값 */ }
+              regions.push({ kind: 'body', sec: s, para: p, text, color: bColor, italic: bItalic });
+            }
+          }
+          reply({ regions });
+        } catch (e: any) {
+          reply(undefined, e?.message || String(e));
+        }
+        break;
+      }
+      // [genDOC patch 0034] 셀 문단 텍스트를 문단 단위 배열로 반환. getFormSkeleton 의 cell.text 는
+      // 문단들을 "\n" join + trim 한 것이라 문단 내부 줄바꿈과 문단 경계가 구분되지 않고 앞뒤 빈
+      // 문단이 소실된다 — 체크박스 in-place 토글·footer 날짜/서명 삽입처럼 cellParaIdx 를 정확히
+      // 겨냥해야 하는 편집을 위해 문단별 원문을 그대로 준다.
+      case 'getCellParagraphTexts': {
+        await initPromise;
+        try {
+          const s = Number(params?.sec ?? 0);
+          const p = Number(params?.parentPara ?? 0);
+          const c = Number(params?.ctrlIdx ?? 0);
+          const ci = Number(params?.cellIdx ?? 0);
+          const count = wasm.getCellParagraphCount(s, p, c, ci);
+          const texts: string[] = [];
+          for (let cp = 0; cp < count; cp++) {
+            let t = '';
+            try { t = wasm.getTextInCell(s, p, c, ci, cp, 0, 4000) ?? ''; } catch { /* 빈 문단 */ }
+            texts.push(t);
+          }
+          reply({ texts });
+        } catch (e: any) {
+          reply(undefined, e?.message || String(e));
+        }
+        break;
+      }
+      // [genDOC host integration] 표 셀 안 지정 위치에 평문 삽입(+셀 글자서식 정규화). 끝 위치 반환.
+      case 'insertTextInCellAt': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const endCell = inputHandler.insertTextInCellAtPosition(
+          Number(params?.sec ?? 0),
+          Number(params?.parentPara ?? 0),
+          Number(params?.ctrlIdx ?? 0),
+          Number(params?.cellIdx ?? 0),
+          Number(params?.cellParaIdx ?? 0),
+          Number(params?.charOffset ?? 0),
+          String(params?.text ?? ''),
+          Boolean(params?.replace), // true면 그 셀 문단 하나의 기존 예시 텍스트를 지우고 채운다
+          // [genDOC patch 0031] 셀 텍스트 크기 통일(1/100pt). 셀 폭 reflow 버그가 고쳐져 안전.
+          typeof params?.fontSize === 'number' ? params.fontSize : undefined,
+          // [genDOC patch 0043 / BAC-865 ②] true면 셀 전체(모든 문단)를 비우고 채운다.
+          Boolean(params?.replaceAll),
+        );
+        reply({ ok: !!endCell, end: endCell });
+        break;
+      }
+      // [genDOC patch 0033] 셀 끝에 새 문단으로 텍스트 추가 — 셀 안 개체(글상자 등) 앵커 보존.
+      // insertTextInCellAt 은 기존 문단 문자 흐름에 삽입해 treat_as_char 앵커가 밀리는 문제가
+      // 있어(요약표 안내 박스 밀림), 개체가 든 셀 채움은 이 RPC 를 쓴다. 새 문단만 검정·비굵게·
+      // (지정 시) fontSize 로 정규화 — 기존 문단/개체 서식 무변경.
+      case 'appendTextParagraphInCell': {
+        await initPromise;
+        try {
+          const sec = Number(params?.sec ?? 0);
+          const parentPara = Number(params?.parentPara ?? 0);
+          const ctrlIdx = Number(params?.ctrlIdx ?? 0);
+          const cellIdx = Number(params?.cellIdx ?? 0);
+          const text = String(params?.text ?? '');
+          const raw = wasm.appendTextParagraphInCell(sec, parentPara, ctrlIdx, cellIdx, text);
+          const parsed = JSON.parse(raw) as { cellParaIndex?: number };
+          const newIdx = Number(parsed?.cellParaIndex ?? -1);
+          if (newIdx >= 0 && text.length > 0) {
+            try {
+              const props: Record<string, unknown> = { textColor: '#000000', bold: false };
+              if (typeof params?.fontSize === 'number' && params.fontSize > 0) props.fontSize = params.fontSize;
+              wasm.applyCharFormatInCell(sec, parentPara, ctrlIdx, cellIdx, newIdx, 0, text.length, JSON.stringify(props));
+            } catch { /* 서식 정규화 실패는 삽입 결과에 영향 없음 */ }
+          }
+          eventBus.emit('document-changed');
+          reply({ ok: newIdx >= 0, cellParaIndex: newIdx });
+        } catch (e: any) {
+          reply(undefined, e?.message || String(e));
+        }
+        break;
+      }
+      // [genDOC host integration] 중첩 표(요약표·산출물의 안쪽 표) 셀에 평문 삽입.
+      // path는 [{controlIndex, cellIndex, cellParaIndex}, ...] 형식의 평면 경로(getFormSkeleton의 nested[].path 그대로).
+      // cursor를 통하지 않고 엔진 직호출 — 깊은 중첩에 cursor DocumentPosition 한 단계 한계가 있기 때문.
+      // 서식 정규화(색·굵기)는 path 기반 API가 없어 생략(셀 기본 서식 상속).
+      case 'insertTextInCellAtByPath': {
+        await initPromise;
+        try {
+          const sec = Number(params?.sec ?? 0);
+          const parentPara = Number(params?.parentPara ?? 0);
+          const path = params?.path;
+          const text = String(params?.text ?? '');
+          const replace = Boolean(params?.replace);
+          const replaceAll = Boolean(params?.replaceAll);
+          if (!Array.isArray(path) || path.length === 0) { reply(undefined, '경로가 비어있습니다'); break; }
+          let pathJson = JSON.stringify(path);
+          // [genDOC patch 0043 / BAC-865 ②] replaceAll: 셀 전체를 비운다. path 기반에는 범위 삭제
+          // API 가 없어(deleteRangeInCellByPath 부재) 뒤 문단부터 앞으로 병합해 한 문단으로 접은 뒤
+          // (merge = 그 문단 제거 + 앞 문단에 이어붙임) 남은 한 문단을 지운다. 빈 문단을 남기지
+          // 않아야 셀 높이가 늘어나 레이아웃이 밀리는 일이 없다. 실패는 바깥 catch 로 정직하게 보고.
+          if (replaceAll) {
+            const cpc = wasm.getCellParagraphCountByPath(sec, parentPara, pathJson);
+            for (let cp = cpc - 1; cp >= 1; cp--) {
+              const mergePath = path.map((e: any, i: number) => (
+                i === path.length - 1 ? { ...e, cellParaIndex: cp } : e
+              ));
+              wasm.mergeParagraphInCellByPath(sec, parentPara, JSON.stringify(mergePath));
+            }
+            // 병합 후엔 0번 문단만 남는다 — 이후 삭제·삽입·서식은 그 문단을 겨냥해야 한다.
+            path[path.length - 1] = { ...path[path.length - 1], cellParaIndex: 0 };
+            pathJson = JSON.stringify(path);
+            const len = wasm.getCellParagraphLengthByPath(sec, parentPara, pathJson);
+            if (len > 0) wasm.deleteTextInCellByPath(sec, parentPara, pathJson, 0, len);
+          }
+          // 마지막 path 엔트리의 cellParaIndex의 문단 길이를 가져와 삭제 범위로 사용.
+          else if (replace) {
+            try {
+              const len = wasm.getCellParagraphLengthByPath(sec, parentPara, pathJson);
+              if (len > 0) wasm.deleteTextInCellByPath(sec, parentPara, pathJson, 0, len);
+            } catch { /* 삭제 실패해도 삽입은 진행 */ }
+          }
+          wasm.insertTextInCellByPath(sec, parentPara, pathJson, 0, text);
+          // [genDOC Task #485/BAC-440] 일반 셀 삽입(insertTextInCellAtPosition)과 동일하게
+          // 검정·비굵게 정규화 — placeholder 빨강 상속 방지.
+          // [genDOC patch 0031] 호스트가 fontSize 를 지정하면 크기도 통일(byPath 는 셀 폭 reflow 기존 지원).
+          try {
+            const len = wasm.getCellParagraphLengthByPath(sec, parentPara, pathJson);
+            if (len > 0) {
+              // [genDOC patch 0048] BAC-1618 — 안내문(파랑+기울임)을 지우고 채우면 기울임이 남는다. 일반 셀은
+              // 호스트(rhwp-cell-insert.ts)가 formatRangeInCell 로 푸는데 by-path 서식 RPC 는 없어 여기서 함께 푼다.
+              const props: Record<string, unknown> = { textColor: '#000000', bold: false, italic: false };
+              if (typeof params?.fontSize === 'number' && params.fontSize > 0) props.fontSize = params.fontSize;
+              wasm.applyCharFormatInCellByPath(
+                sec, parentPara, pathJson, 0, len,
+                JSON.stringify(props),
+              );
+            }
+          } catch { /* 서식 정규화 실패는 삽입 결과에 영향 없음 */ }
+          eventBus.emit('document-changed');
+          reply({ ok: true });
+        } catch (e: any) {
+          reply(undefined, e?.message || String(e));
+        }
+        break;
+      }
+      // [genDOC host integration] 부모가 프로그래매틱하게 save 트리거 (BAC-323 단계 6b).
+      // 기존 save는 사용자 Ctrl+S로만 발동. autoDraft 완료 후 자동 저장이 필요해 RPC로 노출.
+      // dispatcher의 file:save 커맨드는 host 모드에서 자동으로 `saveCurrentDocumentToGenDocHost`
+      // 를 호출 → `gendoc:rhwp:save` 발신 → 부모 PUT → ack가 같은 흐름을 완료시킨다.
+      case 'triggerSave':
+        await initPromise;
+        try {
+          dispatcher.dispatch('file:save');
+          reply({ ok: true });
+        } catch (e: any) {
+          reply(undefined, e?.message || String(e));
+        }
+        break;
+      case 'reflowDocument': {
+        // BAC-371(genDOC) — 호스트(autoDraft)가 대량 삽입 후 호출. 문서 전체를 강제 재배치(모든
+        // 문단 lineseg 재계산 + vpos 0부터 재정렬 + recompose + paginate)해서 페이지 과다분할을 한 번에
+        // 보정한다. reflowLinesegs()(휴리스틱 게이트라 이미 lineseg 있는 삽입 문단을 스킵 → 26페이지
+        // 잔존)로는 부족해 forceFullRelayout() 으로 교체(patch 0012 엔진 API). 없으면 사용자가
+        // 백스페이스+엔터로 수동 정렬해야 함.
+        await initPromise;
+        const reflowed = wasm.forceFullRelayout();
+        canvasView?.loadDocument();
+        reply({ reflowed });
+        break;
+      }
+      // [genDOC host integration] 호스트가 base64 인코딩 PNG/JPG/etc 를 커서 위치에 삽입.
+      // 한컴 클립보드 paste 경로(pasteImageFile)와 동일한 Undo 스냅샷 + 열 폭 축소 로직.
+      case 'insertPicture': {
+        await initPromise;
+        if (!inputHandler) { reply(undefined, '편집기가 준비되지 않았습니다.'); break; }
+        const p = params || {};
+        const b64 = String((p as any).base64 ?? '');
+        if (!b64) { reply(undefined, 'base64 가 비어있습니다.'); break; }
+        let bytes: Uint8Array;
+        try {
+          const binStr = atob(b64);
+          bytes = new Uint8Array(binStr.length);
+          for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+        } catch (err: any) {
+          reply(undefined, 'base64 디코드 실패: ' + (err?.message || String(err)));
+          break;
+        }
+        const ext = String((p as any).ext ?? 'png');
+        const naturalWidth = Number((p as any).naturalWidth) || 560;
+        const naturalHeight = Number((p as any).naturalHeight) || 280;
+        const description = String((p as any).description ?? '');
+        const result = inputHandler.insertPictureProgrammatically(bytes, ext, naturalWidth, naturalHeight, description);
+        reply({ ok: !!(result && result.ok), paraIdx: result?.paraIdx, controlIdx: result?.controlIdx });
+        break;
+      }
+
+      default:
+        reply(undefined, `Unknown method: ${method}`);
+    }
+    })().then(() => reply(undefined), (err: any) => reply(undefined, err?.message || String(err)));
+  });
+}
+
 const initPromise = initialize();
 // 첫 실행이면 스킨 선택을 안내한다 (초기화 성공 후, 임베드 모드 제외).
 // initialize() 는 실패해도 내부에서 삼키고 resolve 하므로, 렌더러가 실제로
@@ -2057,10 +2749,13 @@ installEmbedRuntime({
     },
     async exportHwp() {
       await initPromise;
+      // [genDOC BAC-1856] 셀을 채워 늘어난 표 높이를 저장본에 되쓴다(다시 열 때 저장 조판을 믿는다).
+      if (isGenDocHostMode()) wasm.syncGrownTableFrames();
       return wasm.exportHwp();
     },
     async exportHwpx() {
       await initPromise;
+      if (isGenDocHostMode()) wasm.syncGrownTableFrames();
       return wasm.exportHwpx();
     },
     async exportHml() {
@@ -2122,5 +2817,6 @@ installEmbedRuntime({
     async pluginInvoke(id, method, args) { await initPromise; return plugins.invoke(id, method, args); },
     async chromeGet() { return getChromeVisibility(); },
     async chromeSet(next) { return setChromeVisibility(next as Partial<ChromeVisibility>); },
+    gendoc: genDocRpc,
   },
 });

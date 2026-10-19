@@ -70,6 +70,10 @@ export interface EmbedRpcHandlers {
   pluginInvoke(id: string, method: string, args: unknown[]): Promise<unknown>;
   chromeGet(): Promise<unknown>;
   chromeSet(next: Record<string, unknown>): Promise<unknown>;
+
+  // [genDOC] 호스트 확장 method(옛 main.ts message 핸들러의 genDOC case들). 모르는 method면
+  // `Unknown method:` 오류를 던진다.
+  gendoc?(method: string, params: Record<string, unknown>): Promise<unknown>;
 }
 
 export interface EmbedRendererDiagnosticsV1 {
@@ -205,6 +209,8 @@ export async function routeEmbedRequest(
     );
     case 'chrome.get': return handlers.chromeGet();
     case 'chrome.set': return handlers.chromeSet(asParams(params.visibility));
-    default: throw new Error(`Unknown method: ${method}`);
+    default:
+      if (handlers.gendoc) return handlers.gendoc(method, params);
+      throw new Error(`Unknown method: ${method}`);
   }
 }

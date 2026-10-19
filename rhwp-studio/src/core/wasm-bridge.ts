@@ -803,6 +803,24 @@ export class WasmBridge {
     return (this.doc as any).reflowLinesegs?.() ?? 0;
   }
 
+  /** 문서 전체 강제 재배치 (genDOC BAC-371). 모든 문단 lineseg 재계산 + vpos 0부터 재정렬 + repaginate. 반환: 재계산 문단 수. */
+  forceFullRelayout(): number {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return (this.doc as any).forceFullRelayout?.() ?? 0;
+  }
+
+  /** [genDOC BAC-1856] 늘어난 표 높이를 실측으로 되쓴다(저장 직전). 반환: 고친 표 수. 구엔진이면 0. */
+  syncGrownTableFrames(): number {
+    if (!this.doc) return 0;
+    return (this.doc as any).syncGrownTableFrames?.() ?? 0;
+  }
+
+  // [genDOC patch 0033] 셀 끝에 새 텍스트 문단 추가 — 셀 안 개체(글상자) 앵커 보존 삽입.
+  appendTextParagraphInCell(sec: number, parentPara: number, ctrlIdx: number, cellIdx: number, text: string): string {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return (this.doc as any).appendTextParagraphInCell(sec, parentPara, ctrlIdx, cellIdx, text);
+  }
+
   get pageCount(): number {
     return this.doc?.pageCount() ?? 0;
   }

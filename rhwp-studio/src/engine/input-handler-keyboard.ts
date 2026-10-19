@@ -437,6 +437,12 @@ function pastePlainText(this: any, text: string, hasSelection: boolean): void {
   }
 }
 
+/** [genDOC] 프로그래밍적 평문 삽입 — AI 결과를 커서 위치에 넣는다(선택 영역 있으면 교체).
+ *  paste 평문 경로와 동일하게 InsertTextCommand/SplitParagraph + undo 스냅샷을 탄다. */
+export function insertPlainTextProgrammatically(this: any, text: string): void {
+  pastePlainText.call(this, text, this.cursor.hasSelection());
+}
+
 export function prepareRhwpInternalClipboardHtml(self: any, html: string, text = ''): string {
   const token = createRhwpClipboardToken();
   self.rhwpClipboardToken = token;
@@ -2227,6 +2233,70 @@ async function pasteImageFile(this: any, file: File, hasSelection: boolean): Pro
     }});
   } catch (err) {
     console.warn('[InputHandler] 클립보드 이미지 삽입 실패:', err);
+  }
+}
+
+/** [genDOC] 호스트에서 받은 Uint8Array 이미지를 커서 위치에 즉시 삽입.
+ *  pasteImageFile 의 본문 로직(열 폭 자동 축소 + Undo 스냅샷)을 재사용한다 — 입력만
+ *  File→bytes 변환이 빠진 버전. */
+export function insertPictureProgrammaticallyImpl(
+  this: any,
+  data: Uint8Array,
+  ext: string,
+  naturalWidth: number,
+  naturalHeight: number,
+  description: string,
+): { ok: boolean; paraIdx: number; controlIdx: number } | null {
+  try {
+    // px → HWPUNIT (1px = 75 HWPUNIT at 96 DPI)
+    let wHwp = Math.round(naturalWidth * 75);
+    let hHwp = Math.round(naturalHeight * 75);
+
+    // 열 폭 초과 시 비례 축소
+    const pos = this.cursor.getPosition();
+    try {
+      const pageDef = this.wasm.getPageDef(pos.sectionIndex);
+      const colWidth = pageDef.width - pageDef.marginLeft - pageDef.marginRight;
+      if (wHwp > colWidth) {
+        const ratio = colWidth / wHwp;
+        wHwp = Math.round(colWidth);
+        hHwp = Math.round(hHwp * ratio);
+      }
+    } catch { /* 페이지 정보 없으면 그대로 */ }
+
+    const hasSelection = this.cursor.hasSelection();
+    let captured: { ok: boolean; paraIdx: number; controlIdx: number } | null = null;
+    this.executeOperation({ kind: 'snapshot', operationType: 'gendocInsertPicture', operation: (wasm: WasmBridge) => {
+      if (hasSelection) this.deleteSelection();
+      const p = this.cursor.getPosition();
+      // [v0.8.7] insertPicture 에 cellPathJson 인자가 추가됐다(#1151) — 붙여넣기 경로와 같은 규약.
+      const inCell = (p.cellPath?.length ?? 0) > 0 && p.parentParaIndex !== undefined;
+      const result = wasm.insertPicture(
+        p.sectionIndex, inCell ? p.parentParaIndex! : p.paragraphIndex, p.charOffset,
+        inCell ? JSON.stringify(p.cellPath) : '',
+        data, wHwp, hHwp, naturalWidth, naturalHeight, ext, description,
+      );
+      if (result.ok) {
+        // [v0.8.7] insertPicture 기본값이 어울림(Square) 개체로 바뀌었다 — 운영(0.7.12)처럼 글자처럼 취급으로 둔다
+        // (upstream 드롭 삽입 경로와 같은 후처리).
+        if (inCell) {
+          wasm.setCellPicturePropertiesByPath(p.sectionIndex, p.parentParaIndex!, p.cellPath!, result.controlIdx, { treatAsChar: true });
+        } else {
+          wasm.setPictureProperties(p.sectionIndex, result.paraIdx, result.controlIdx, { treatAsChar: true });
+        }
+        captured = result;
+        return {
+          sectionIndex: p.sectionIndex,
+          paragraphIndex: result.paraIdx + 1,
+          charOffset: 0,
+        } as DocumentPosition;
+      }
+      return p;
+    }});
+    return captured;
+  } catch (err) {
+    console.warn('[InputHandler] insertPictureProgrammatically 실패:', err);
+    return null;
   }
 }
 

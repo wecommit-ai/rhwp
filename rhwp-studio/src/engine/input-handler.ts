@@ -8,6 +8,9 @@ import { CaretRenderer } from './caret-renderer';
 import { resolveGlyphStartRect, isCompositionBoxRepresentable } from './line-start-affinity';
 import { FieldMarkerRenderer } from './field-marker-renderer';
 import { SelectionRenderer } from './selection-renderer';
+import { CommentHighlightRenderer } from './comment-highlight-renderer';
+import { ReviewHighlightRenderer } from './review-highlight-renderer';
+import { CitationLinkRenderer } from './citation-link-renderer';
 import { CommandHistory } from './history';
 import { DeleteSelectionCommand, ApplyCharFormatCommand, ApplyParaFormatCommand, SnapshotCommand, SubmodeSnapshotCommand, SubmodeSelectionSnapshotCommand, SetFormValueCommand, TextMutationEffectAccumulator, IMMEDIATE_TEXT_MUTATION_EFFECTS, applyCharShapeModsToRange, cellAxisPath, cellParaIndexOf } from './command';
 import type { OperationDescriptor, ParaFormatTarget, RefreshPolicy, TextMutationEffects, EditCommand, EditContext, HeaderFooterSelectionSnapshot, FormValueTarget } from './command';
@@ -312,12 +315,46 @@ function createOverlayLabel(x: number, y: number, text: string): HTMLDivElement 
   return label;
 }
 
+/** [genDOC FE-609] 코멘트 하이라이트 항목 — findText 매치 좌표 그대로(본문 또는 셀). */
+export type CommentHighlightItem = {
+  id: string;
+  sec: number;
+  para: number;
+  charOffset: number;
+  length: number;
+  cellContext?: { parentPara: number; ctrlIdx: number; cellIdx: number; cellPara: number };
+};
+
+/** [genDOC BAC-701] 출처 링크 항목 — 코멘트 하이라이트와 같은 findText 매치 좌표 + 대상 URL. */
+export type CitationLinkItem = CommentHighlightItem & { url: string };
+
+/** [genDOC BAC-840] 검토(첨삭) 하이라이트 항목 — 코멘트와 동일 좌표 규약(findText 매치).
+ *  color 를 주면 그 항목만 지정 색으로 그린다(카테고리 구분용, 옵션). */
+export type ReviewHighlightItem = {
+  id: string;
+  sec: number;
+  para: number;
+  charOffset: number;
+  length: number;
+  color?: string;
+  cellContext?: { parentPara: number; ctrlIdx: number; cellIdx: number; cellPara: number };
+};
+
 /** 클릭 커서 배치 + 키보드 입력을 처리한다 */
 export class InputHandler {
   private cursor: CursorState;
   private caret: CaretRenderer;
   private fieldMarker: FieldMarkerRenderer;
   private selectionRenderer: SelectionRenderer;
+  // [genDOC FE-609] 코멘트 앵커 상시 하이라이트(노란 오버레이) + 호스트가 푸시한 범위 목록
+  private commentHighlightRenderer: CommentHighlightRenderer;
+  private commentHighlightItems: CommentHighlightItem[] = [];
+  // [genDOC BAC-840] 검토 앵커 상시 하이라이트(인디고 오버레이) — 코멘트 레이어와 완전 독립
+  private reviewHighlightRenderer: ReviewHighlightRenderer;
+  private reviewHighlightItems: ReviewHighlightItem[] = [];
+  // [genDOC BAC-701] 출처 인용 클릭 링크(투명 오버레이) + 호스트가 푸시한 범위 목록
+  private citationLinkRenderer: CitationLinkRenderer;
+  private citationLinkItems: CitationLinkItem[] = [];
   private history: CommandHistory;
   private textarea: HTMLTextAreaElement;
   private active = false;
@@ -576,6 +613,9 @@ export class InputHandler {
     this.caret = new CaretRenderer(container, virtualScroll);
     this.fieldMarker = new FieldMarkerRenderer(container, virtualScroll);
     this.selectionRenderer = new SelectionRenderer(container, virtualScroll);
+    this.commentHighlightRenderer = new CommentHighlightRenderer(container, virtualScroll);
+    this.reviewHighlightRenderer = new ReviewHighlightRenderer(container, virtualScroll);
+    this.citationLinkRenderer = new CitationLinkRenderer(container, virtualScroll);
     this.history = new CommandHistory();
     this.deferredPaginationRunner = new DeferredPaginationRunner(
       wasm,
@@ -714,6 +754,13 @@ export class InputHandler {
         if (this.cursor.isInTableObjectSelection()) {
           this.renderTableObjectSelection();
         }
+        // [genDOC FE-609] 리플로우 후 코멘트 하이라이트 좌표 재계산. 편집으로 문단 인덱스가
+        // 어긋난 항목은 일시적으로 빠질 수 있다 — 호스트가 디바운스 재앵커 후 다시 푸시한다.
+        this.refreshCommentHighlights();
+        // [genDOC BAC-840] 검토 하이라이트도 동일 재계산(코멘트와 독립).
+        this.refreshReviewHighlights();
+        // [genDOC BAC-701] 출처 링크 오버레이도 동일 재계산.
+        this.refreshCitationLinks();
       });
     });
     eventBus.on('create-new-document', () => {
@@ -749,6 +796,10 @@ export class InputHandler {
     if (this.cursor.isInCellSelectionMode()) this.updateCellSelection();
     if (this.cursor.isInPictureObjectSelection()) this.renderPictureObjectSelection();
     if (this.cursor.isInTableObjectSelection()) this.renderTableObjectSelection();
+    // [genDOC FE-609·BAC-840·BAC-701] 코멘트·검토 하이라이트, 출처 링크 오버레이 줌/resize 동기화
+    this.refreshCommentHighlights();
+    this.refreshReviewHighlights();
+    this.refreshCitationLinks();
   }
 
   /** 클릭 이벤트 처리 — hitTest로 커서 배치 */
@@ -938,6 +989,14 @@ export class InputHandler {
       console.warn('[InputHandler] 드롭 그림 삽입 실패:', err);
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
+  }
+
+  /** [genDOC] 호스트가 이미지를 커서 위치에 즉시 삽입(드래그 배치 모드 우회).
+   *  pasteImageFile 의 본문 로직(열 폭 자동 축소 + Undo 스냅샷)을 재사용한다. */
+  insertPictureProgrammatically(
+    data: Uint8Array, ext: string, naturalWidth: number, naturalHeight: number, description: string = '',
+  ): { ok: boolean; paraIdx: number; controlIdx: number } | null {
+    return _keyboard.insertPictureProgrammaticallyImpl.call(this, data, ext, naturalWidth, naturalHeight, description);
   }
 
   /** 그림 배치 모드 취소 */
@@ -4529,6 +4588,9 @@ export class InputHandler {
     this.caret.dispose();
     this.fieldMarker.dispose();
     this.selectionRenderer.dispose();
+    this.commentHighlightRenderer.dispose();
+    this.reviewHighlightRenderer.dispose();
+    this.citationLinkRenderer.dispose();
     this.cellSelectionRenderer?.dispose();
     this.tableObjectRenderer?.dispose();
     this.tableResizeRenderer?.dispose();
@@ -5274,6 +5336,682 @@ export class InputHandler {
       return null;
     }
   }
+  /** [genDOC] 호스트(AI)가 커서 위치에 평문을 삽입한다(선택 영역 있으면 교체). */
+  insertPlainTextAtCursor(text: string): void {
+    _keyboard.insertPlainTextProgrammatically.call(this, text);
+  }
+
+  /** [genDOC BAC-414] 주어진 범위(start..end)를 선택 상태로 만든 뒤 평문으로 교체한다.
+   *  채택 시점에 엔진 선택이 풀려 있어도(=커서만 남아 append되던 버그) 호스트가 생성 시점에
+   *  잡아둔 범위로 결정적으로 교체하기 위함. start로 커서를 옮겨 anchor를 잡고, end로 focus를
+   *  옮겨(moveCursorTo는 선택을 지우므로 cursor.moveTo로 anchor 보존) 선택을 만든 다음, paste
+   *  평문 경로(선택 있으면 deleteSelection 후 삽입)를 탄다. end가 무효면 start에 그냥 삽입(폴백). */
+  replaceRangeWithText(start: DocumentPosition, end: DocumentPosition, text: string): boolean {
+    if (!this.moveCursorTo(start)) return false;
+    let hasRange = false;
+    try {
+      const r = this.wasm.getCursorRect(end.sectionIndex, end.paragraphIndex, end.charOffset);
+      if (r && r.pageIndex !== undefined) {
+        this.cursor.setAnchor();   // anchor = start
+        this.cursor.moveTo(end);   // focus = end (anchor 보존 → start..end 선택)
+        hasRange = true;
+      }
+    } catch { /* 폴백: 범위 무효 시 start 위치에 삽입 */ }
+    void hasRange;
+    _keyboard.insertPlainTextProgrammatically.call(this, text);
+    return true;
+  }
+
+  /** [genDOC BAC-433] 주어진 범위(start..end)를 선택 상태로 만들고 캔버스를 그 위치로 스크롤한다.
+   *  편집은 하지 않는다 — AI 검토 카드의 "본문에서 보기"가 제안 대상 위치를 하이라이트하는 용도.
+   *  replaceRangeWithText(0013)의 선택 생성 패턴을 그대로 쓰되, 삽입 대신 updateCaret()로
+   *  선택 하이라이트 렌더 + scrollCaretIntoView 만 트리거한다. end가 무효면 start 캐럿만(폴백). */
+  selectRange(start: DocumentPosition, end: DocumentPosition): boolean {
+    if (!this.moveCursorTo(start)) return false;
+    try {
+      const r = this.wasm.getCursorRect(end.sectionIndex, end.paragraphIndex, end.charOffset);
+      if (r && r.pageIndex !== undefined) {
+        this.cursor.setAnchor();   // anchor = start
+        this.cursor.moveTo(end);   // focus = end (anchor 보존 → start..end 선택)
+        this.updateCaret();        // 선택 영역 렌더 + 그 위치로 스크롤
+      }
+    } catch { /* 폴백: 범위 무효 시 start 캐럿만 표시 */ }
+    return true;
+  }
+
+  /** [genDOC FE-609] 코멘트 앵커 하이라이트 목록을 통째로 교체하고 다시 그린다.
+   *  항목은 findText 매치 좌표 그대로(본문 또는 셀). 좌표가 무효해진 항목은 조용히
+   *  건너뛴다 — 호스트가 snippet 재탐색(재앵커) 후 다시 푸시한다. 렌더된 개수 반환. */
+  setCommentHighlights(items: CommentHighlightItem[]): number {
+    this.commentHighlightItems = Array.isArray(items) ? items : [];
+    return this.refreshCommentHighlights();
+  }
+
+  /** 저장된 코멘트 범위들의 줄 사각형을 재계산해 그린다(줌 변경·리플로우 후 호출). */
+  refreshCommentHighlights(): number {
+    const zoom = this.viewportManager.getZoom();
+    const groups: Array<{ id: string; rects: import('@/core/types').SelectionRect[] }> = [];
+    for (const it of this.commentHighlightItems) {
+      try {
+        const rects = it.cellContext
+          ? this.wasm.getSelectionRectsInCell(
+              it.sec, it.cellContext.parentPara, it.cellContext.ctrlIdx, it.cellContext.cellIdx,
+              it.cellContext.cellPara, it.charOffset, it.cellContext.cellPara, it.charOffset + it.length,
+            )
+          : this.wasm.getSelectionRects(it.sec, it.para, it.charOffset, it.para, it.charOffset + it.length);
+        if (rects && rects.length > 0) groups.push({ id: it.id, rects });
+      } catch { /* 좌표 무효 — 호스트 재앵커 대기 */ }
+    }
+    this.commentHighlightRenderer.render(groups, zoom);
+    return groups.length;
+  }
+
+  /** [genDOC BAC-701] 출처 링크 목록을 통째로 교체하고 다시 그린다. 좌표 무효 항목은 조용히
+   *  건너뛴다(코멘트 하이라이트와 동일 규약). 렌더된 개수 반환. */
+  setCitationLinks(items: CitationLinkItem[]): number {
+    this.citationLinkItems = Array.isArray(items) ? items : [];
+    return this.refreshCitationLinks();
+  }
+
+  /** 저장된 출처 링크 범위들의 줄 사각형을 재계산해 그린다(줌 변경·리플로우 후 호출). */
+  refreshCitationLinks(): number {
+    const zoom = this.viewportManager.getZoom();
+    const groups: Array<{ id: string; url: string; rects: import('@/core/types').SelectionRect[] }> = [];
+    for (const it of this.citationLinkItems) {
+      try {
+        const rects = it.cellContext
+          ? this.wasm.getSelectionRectsInCell(
+              it.sec, it.cellContext.parentPara, it.cellContext.ctrlIdx, it.cellContext.cellIdx,
+              it.cellContext.cellPara, it.charOffset, it.cellContext.cellPara, it.charOffset + it.length,
+            )
+          : this.wasm.getSelectionRects(it.sec, it.para, it.charOffset, it.para, it.charOffset + it.length);
+        if (rects && rects.length > 0) groups.push({ id: it.id, url: it.url, rects });
+      } catch { /* 좌표 무효 — 호스트 재푸시 대기 */ }
+    }
+    this.citationLinkRenderer.render(groups, zoom);
+    return groups.length;
+  }
+
+  /** [genDOC BAC-701/patch 0036] 등록된 출처 링크들의 페이지 좌표 사각형을 반환한다(줌 미적용
+   *  원좌표). PDF export 가 링크 주석(annotation) 위치로 쓴다. 좌표 무효 항목은 스킵. */
+  getCitationLinkRects(): Array<{ url: string; rects: import('@/core/types').SelectionRect[] }> {
+    const out: Array<{ url: string; rects: import('@/core/types').SelectionRect[] }> = [];
+    for (const it of this.citationLinkItems) {
+      try {
+        const rects = it.cellContext
+          ? this.wasm.getSelectionRectsInCell(
+              it.sec, it.cellContext.parentPara, it.cellContext.ctrlIdx, it.cellContext.cellIdx,
+              it.cellContext.cellPara, it.charOffset, it.cellContext.cellPara, it.charOffset + it.length,
+            )
+          : this.wasm.getSelectionRects(it.sec, it.para, it.charOffset, it.para, it.charOffset + it.length);
+        if (rects && rects.length > 0) out.push({ url: it.url, rects });
+      } catch { /* 좌표 무효 — 스킵 */ }
+    }
+    return out;
+  }
+
+  /** [genDOC FE-609] 해당 코멘트 하이라이트로 스크롤(뷰포트 1/3 지점) + 플래시 강조.
+   *  렌더된 하이라이트가 없으면 false — 호스트가 재앵커 폴백을 탄다. */
+  focusCommentHighlight(id: string): boolean {
+    this.refreshCommentHighlights();
+    const top = this.commentHighlightRenderer.topOf(id);
+    if (top === null) return false;
+    const target = Math.max(0, top - this.container.clientHeight / 3);
+    const max = Math.max(0, this.container.scrollHeight - this.container.clientHeight);
+    this.container.scrollTop = Math.max(0, Math.min(max, target));
+    this.commentHighlightRenderer.flash(id);
+    return true;
+  }
+
+  /** [genDOC BAC-840] 검토 앵커 하이라이트 목록을 통째로 교체하고 다시 그린다(코멘트 레이어 불변).
+   *  좌표가 무효해진 항목은 조용히 건너뛴다 — 호스트가 snippet 재탐색(재앵커) 후 다시 푸시한다.
+   *  렌더된 개수 반환. items=[] 이면 레이어를 비운다. */
+  setReviewHighlights(items: ReviewHighlightItem[]): number {
+    this.reviewHighlightItems = Array.isArray(items) ? items : [];
+    return this.refreshReviewHighlights();
+  }
+
+  /** 저장된 검토 범위들의 줄 사각형을 재계산해 그린다(줌 변경·리플로우 후 호출). */
+  refreshReviewHighlights(): number {
+    const zoom = this.viewportManager.getZoom();
+    const groups: Array<{ id: string; rects: import('@/core/types').SelectionRect[]; color?: string }> = [];
+    for (const it of this.reviewHighlightItems) {
+      try {
+        const rects = it.cellContext
+          ? this.wasm.getSelectionRectsInCell(
+              it.sec, it.cellContext.parentPara, it.cellContext.ctrlIdx, it.cellContext.cellIdx,
+              it.cellContext.cellPara, it.charOffset, it.cellContext.cellPara, it.charOffset + it.length,
+            )
+          : this.wasm.getSelectionRects(it.sec, it.para, it.charOffset, it.para, it.charOffset + it.length);
+        if (rects && rects.length > 0) groups.push({ id: it.id, rects, color: it.color });
+      } catch { /* 좌표 무효 — 호스트 재앵커 대기 */ }
+    }
+    this.reviewHighlightRenderer.render(groups, zoom);
+    return groups.length;
+  }
+
+  /** [genDOC BAC-840] 해당 검토 하이라이트로 스크롤(뷰포트 1/3 지점) + 플래시 강조.
+   *  렌더된 하이라이트가 없으면 false — 호스트가 재앵커 폴백을 탄다. */
+  focusReviewHighlight(id: string): boolean {
+    this.refreshReviewHighlights();
+    const top = this.reviewHighlightRenderer.topOf(id);
+    if (top === null) return false;
+    const target = Math.max(0, top - this.container.clientHeight / 3);
+    const max = Math.max(0, this.container.scrollHeight - this.container.clientHeight);
+    this.container.scrollTop = Math.max(0, Math.min(max, target));
+    this.reviewHighlightRenderer.flash(id);
+    return true;
+  }
+
+  private cursorRectToClientRect(
+    r: { pageIndex?: number; x: number; y: number; height: number } | null | undefined,
+  ): { x: number; y: number; h: number; visible: boolean } | null {
+    if (!r || r.pageIndex === undefined) return null;
+    const zoom = this.viewportManager.getZoom();
+    const scrollContent = this.container.querySelector('#scroll-content') as HTMLElement | null;
+    if (!scrollContent) return null;
+    const cr = scrollContent.getBoundingClientRect();
+    const pageOffset = this.virtualScroll.getPageOffset(r.pageIndex);
+    const pageLeft = this.virtualScroll.getPageLeftResolved(r.pageIndex, scrollContent.clientWidth);
+    const x = cr.left + pageLeft + r.x * zoom;
+    const y = cr.top + pageOffset + r.y * zoom;
+    const h = r.height * zoom;
+    const cont = this.container.getBoundingClientRect();
+    const visible = y + h > cont.top + 4 && y < cont.bottom - 4 && x > cont.left - 40 && x < cont.right + 40;
+    return { x, y, h, visible };
+  }
+
+  /** [genDOC FE-598] 주어진 본문 위치(sec,para,charOffset)의 캐럿을 viewport(client) 좌표로 반환한다.
+   *  편집·스크롤·선택을 일으키지 않는 순수 조회 — 호스트가 원격 협업자 커서를 iframe 위 오버레이로
+   *  그리는 용도. 좌표계는 CaretRenderer 와 동일(scroll-content rect + 페이지오프셋 + r.x*zoom)을
+   *  viewport 로 변환한다. 화면 밖이면 visible=false. */
+  getCaretClientRect(sec: number, para: number, charOffset: number): { x: number; y: number; h: number; visible: boolean } | null {
+    try {
+      return this.cursorRectToClientRect(this.wasm.getCursorRect(sec, para, charOffset));
+    } catch {
+      return null;
+    }
+  }
+
+  /** [genDOC FE-721] 주어진 표 셀 위치의 캐럿을 viewport(client) 좌표로 반환한다.
+   *  remote collaborator 가 표 셀 안에서 편집 중일 때도 Google Docs 처럼 이름표와 caret 을 셀 위치에 붙인다. */
+  getCaretClientRectInCell(
+    sec: number,
+    parentPara: number,
+    ctrlIdx: number,
+    cellIdx: number,
+    cellParaIdx: number,
+    charOffset: number,
+  ): { x: number; y: number; h: number; visible: boolean } | null {
+    try {
+      return this.cursorRectToClientRect(
+        this.wasm.getCursorRectInCell(sec, parentPara, ctrlIdx, cellIdx, cellParaIdx, charOffset),
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  private selectionRectToClientRect(
+    rect: import('@/core/types').SelectionRect,
+  ): { x: number; y: number; width: number; h: number; visible: boolean } | null {
+    const zoom = this.viewportManager.getZoom();
+    const scrollContent = this.container.querySelector('#scroll-content') as HTMLElement | null;
+    if (!scrollContent) return null;
+    const cr = scrollContent.getBoundingClientRect();
+    const pageOffset = this.virtualScroll.getPageOffset(rect.pageIndex);
+    const pageLeft = this.virtualScroll.getPageLeftResolved(rect.pageIndex, scrollContent.clientWidth);
+    const x = cr.left + pageLeft + rect.x * zoom;
+    const y = cr.top + pageOffset + rect.y * zoom;
+    const width = rect.width * zoom;
+    const h = rect.height * zoom;
+    const cont = this.container.getBoundingClientRect();
+    const visible = y + h > cont.top + 4 && y < cont.bottom - 4 && x + width > cont.left - 40 && x < cont.right + 40;
+    return { x, y, width, h, visible };
+  }
+
+  /** [genDOC FE-721] 주어진 본문/동일 셀 선택 범위의 줄별 selection rect 를 viewport(client) 좌표로 반환한다.
+   *  호스트가 원격 협업자 드래그 선택을 Google Docs 처럼 여러 줄 하이라이트로 그리는 용도.
+   *  편집·스크롤·현재 선택 변경을 일으키지 않는 조회 전용 RPC이며, 서로 다른 셀/본문 혼합 범위는 빈 배열로 둔다. */
+  getSelectionClientRects(
+    start: DocumentPosition,
+    end: DocumentPosition,
+  ): Array<{ x: number; y: number; width: number; h: number; visible: boolean }> {
+    try {
+      const startInCell = start.parentParaIndex !== undefined;
+      const endInCell = end.parentParaIndex !== undefined;
+      let rects: import('@/core/types').SelectionRect[];
+      if (
+        startInCell &&
+        endInCell &&
+        start.sectionIndex === end.sectionIndex &&
+        start.parentParaIndex === end.parentParaIndex &&
+        start.controlIndex === end.controlIndex &&
+        start.cellIndex === end.cellIndex &&
+        start.controlIndex !== undefined &&
+        start.cellIndex !== undefined
+      ) {
+        rects = this.wasm.getSelectionRectsInCell(
+          start.sectionIndex,
+          start.parentParaIndex!,
+          start.controlIndex,
+          start.cellIndex,
+          start.cellParaIndex ?? 0,
+          start.charOffset,
+          end.cellParaIndex ?? 0,
+          end.charOffset,
+        );
+      } else if (!startInCell && !endInCell && start.sectionIndex === end.sectionIndex) {
+        rects = this.wasm.getSelectionRects(
+          start.sectionIndex,
+          start.paragraphIndex,
+          start.charOffset,
+          end.paragraphIndex,
+          end.charOffset,
+        );
+      } else {
+        return [];
+      }
+      return rects
+        .map((rect) => this.selectionRectToClientRect(rect))
+        .filter((rect): rect is { x: number; y: number; width: number; h: number; visible: boolean } => !!rect);
+    } catch {
+      return [];
+    }
+  }
+
+  /** [genDOC FE-600] 현재 캐럿의 본문 위치를 반환한다(선택이 없어도 — collapsed 커서 포함).
+   *  getSelection 은 anchor 없으면 null 이라 원격 협업자 커서 송신에 못 쓴다. 이건 항상 위치를 준다. */
+  getCaretPosition(): DocumentPosition | null {
+    try {
+      return this.cursor.getPosition();
+    } catch {
+      return null;
+    }
+  }
+
+  /** [genDOC BAC-448] 주어진 범위(start..end)의 글자 서식만 변경한다(텍스트는 불변).
+   *  AI 채움·교체의 인라인 트랙체인지 표시용 — 기존 텍스트를 빨강+취소선으로, 새 텍스트를
+   *  초록으로 칠한다. propsJson 은 applyCharFormat 과 동일 스키마({ textColor, strikethrough,
+   *  bold, fontSize ... }). 범위가 여러 문단에 걸치면 각 문단의 해당 구간에 적용한다.
+   *  start/end 는 같은 구역 가정(검토 제안은 한 구역 내). 성공 시 true. */
+  formatRange(start: DocumentPosition, end: DocumentPosition, propsJson: string): boolean {
+    const sec = start.sectionIndex;
+    if (end.sectionIndex !== sec) return false;
+    try {
+      for (let p = start.paragraphIndex; p <= end.paragraphIndex; p++) {
+        const len = (this.wasm.getTextRange(sec, p, 0, 100000) ?? '').length;
+        const so = p === start.paragraphIndex ? start.charOffset : 0;
+        const eo = p === end.paragraphIndex ? end.charOffset : len;
+        if (eo > so) this.wasm.applyCharFormat(sec, p, so, eo, propsJson);
+      }
+      this.eventBus.emit('document-changed'); // 서식 반영 재렌더
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** [genDOC BAC-460] 표 셀로 스크롤한다(편집 없이 위치만). selectRange는 표만 있는 본문 문단에서
+   *  getCursorRect가 무효라 스크롤이 안 되므로, getCursorRectInCell + 셀 멀티레벨 커서 이동으로 그
+   *  셀을 화면에 띄운다(insertTextInCellAtPosition의 위치 잡기 경로 재사용, 삽입은 안 함). AI 검토
+   *  카드의 "본문에서 보기"가 표 셀 제안을 클릭했을 때 사용. 셀 좌표가 무효면 false. */
+  scrollToCell(sec: number, parentPara: number, ctrlIdx: number, cellIdx: number, cellParaIdx: number, charOffset: number): boolean {
+    try {
+      const rect = this.wasm.getCursorRectInCell(sec, parentPara, ctrlIdx, cellIdx, cellParaIdx, charOffset);
+      if (!rect || rect.pageIndex === undefined) return false;
+    } catch {
+      return false;
+    }
+    this.cursor.clearSelection();
+    this.cursor.moveTo({
+      sectionIndex: sec,
+      paragraphIndex: parentPara,
+      parentParaIndex: parentPara,
+      controlIndex: ctrlIdx,
+      cellIndex: cellIdx,
+      cellParaIndex: cellParaIdx,
+      charOffset,
+    });
+    this.cursor.resetPreferredX();
+    this.active = true;
+    this.updateCaret(); // scrollCaretIntoView 포함
+    return true;
+  }
+
+  /** [genDOC BAC-460+] 표 셀 내부 범위(startCellPara/startOffset..endCellPara/endOffset)의 글자
+   *  서식만 변경(텍스트 불변). formatRange의 셀 버전 — 인라인 트랙체인지를 표 셀 안에서도 그린다
+   *  (기존=빨강+취소선, 신규=초록). 색·취소선·굵기만 안전(applyCharFormatInCell은 fontSize 변경 시
+   *  셀 폭이 아닌 페이지 단 폭으로 LineSeg 재계산하는 버그가 있어 size는 건드리지 않음). 성공 시 true. */
+  formatRangeInCell(
+    sec: number, parentPara: number, ctrlIdx: number, cellIdx: number,
+    startCellPara: number, startOffset: number,
+    endCellPara: number, endOffset: number,
+    propsJson: string,
+  ): boolean {
+    try {
+      for (let cp = startCellPara; cp <= endCellPara; cp++) {
+        const len = (this.wasm.getTextInCell(sec, parentPara, ctrlIdx, cellIdx, cp, 0, 100000) ?? '').length;
+        const so = cp === startCellPara ? startOffset : 0;
+        const eo = cp === endCellPara ? endOffset : len;
+        if (eo > so) this.wasm.applyCharFormatInCell(sec, parentPara, ctrlIdx, cellIdx, cp, so, eo, propsJson);
+      }
+      this.eventBus.emit('document-changed');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** [genDOC BAC-460+] 표 셀 내부 단일 셀문단의 범위 텍스트를 삭제(인라인 미리보기 확정/취소 시
+   *  빨강 기존 또는 초록 신규 구간 제거). 성공 시 true. */
+  deleteRangeInCell(
+    sec: number, parentPara: number, ctrlIdx: number, cellIdx: number,
+    cellPara: number, startOffset: number, length: number,
+  ): boolean {
+    try {
+      if (length > 0) this.wasm.deleteTextInCell(sec, parentPara, ctrlIdx, cellIdx, cellPara, startOffset, length);
+      this.eventBus.emit('document-changed');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** [genDOC BAC-460+] 현재 세로 스크롤 위치(px). 편집 직전에 저장했다가 편집 후 setScrollTop으로
+   *  복원하면, reflow가 스크롤을 문서 맨 위로 리셋하는 현상(변경/유지 후 처음으로 튐)을 상쇄한다. */
+  getScrollTop(): number {
+    return this.container.scrollTop;
+  }
+
+  /** [genDOC BAC-460+] 세로 스크롤 위치 복원(reflow 완료 후 호출). 범위를 벗어나지 않게 clamp. */
+  setScrollTop(y: number): void {
+    const max = Math.max(0, this.container.scrollHeight - this.container.clientHeight);
+    this.container.scrollTop = Math.max(0, Math.min(max, y));
+  }
+
+  /** [genDOC BAC-506] 한 셀의 전체 평문(셀 문단들을 개행으로 연결). 실패 시 ''. */
+  getCellPlainText(sec: number, ppi: number, ci: number, cellIdx: number): string {
+    try {
+      const n = this.wasm.getCellParagraphCount(sec, ppi, ci, cellIdx);
+      const parts: string[] = [];
+      for (let cp = 0; cp < n; cp++) {
+        parts.push(this.wasm.getTextInCell(sec, ppi, ci, cellIdx, cp, 0, 100000) ?? '');
+      }
+      return parts.join('\n').trim();
+    } catch {
+      return '';
+    }
+  }
+
+  /** [genDOC BAC-506] 셀 선택 모드(표 셀 범위 선택)의 선택 셀 텍스트를 반환한다.
+   *  같은 행의 셀은 탭, 행 간은 개행으로 연결 — 호스트(차트/검토/토의)가 표 데이터를
+   *  텍스트로 읽는 용도. 셀 선택 모드가 아니면 ''. 중첩 표(cellPath>1)는 미지원(''). */
+  getCellSelectionPlainText(): string {
+    try {
+      if (!this.cursor.isInCellSelectionMode()) return '';
+      const range = this.cursor.getSelectedCellRange();
+      const ctx = this.cursor.getCellTableContext();
+      if (!range || !ctx) return '';
+      if (ctx.cellPath && ctx.cellPath.length > 1) return '';
+      const excluded = this.cursor.getExcludedCells();
+      const bboxes = this.wasm.getTableCellBboxes(ctx.sec, ctx.ppi, ctx.ci);
+      const seen = new Set<number>();
+      const byRow = new Map<number, { col: number; text: string }[]>();
+      for (const bb of bboxes) {
+        if (seen.has(bb.cellIdx)) continue; // 페이지 분할 표의 중복 bbox 제거
+        seen.add(bb.cellIdx);
+        if (bb.row < range.startRow || bb.row > range.endRow) continue;
+        if (bb.col < range.startCol || bb.col > range.endCol) continue;
+        if (excluded.has(`${bb.row},${bb.col}`)) continue; // Ctrl+클릭 제외 셀
+        const text = this.getCellPlainText(ctx.sec, ctx.ppi, ctx.ci, bb.cellIdx);
+        if (!byRow.has(bb.row)) byRow.set(bb.row, []);
+        byRow.get(bb.row)!.push({ col: bb.col, text });
+      }
+      const rows = [...byRow.keys()].sort((a, b) => a - b);
+      return rows
+        .map((r) => byRow.get(r)!.sort((a, b) => a.col - b.col).map((c) => c.text).join('\t'))
+        .join('\n')
+        .trim();
+    } catch {
+      return '';
+    }
+  }
+
+  /** [genDOC BAC-507] 현재 커서(본문) 위치에 rows×cols 표를 삽입한다(undo 1단위 —
+   *  스튜디오 table:create 커맨드와 동일한 wasm.createTable 경로). 표 셀 안 커서·실패면 null.
+   *  성공 시 표 좌표와 셀 그리드(cellIdx↔row/col)를 반환 — 호스트가 insertTextInCellAt
+   *  (patch 0007 cellfill)로 이어서 셀을 채운다. */
+  insertTableAtCursor(rows: number, cols: number): {
+    sec: number; parentPara: number; ctrlIdx: number; rows: number; cols: number;
+    cells: { cellIdx: number; row: number; col: number }[];
+  } | null {
+    try {
+      const pos = this.cursor.getPosition();
+      if (pos.parentParaIndex !== undefined) return null; // 표 셀 안에는 표 삽입 미지원
+      let createdPara = -1;
+      let createdCtrl = -1;
+      this.executeOperation({
+        kind: 'snapshot',
+        operationType: 'createTable',
+        operation: (wasm) => {
+          const result = wasm.createTable(pos.sectionIndex, pos.paragraphIndex, pos.charOffset, rows, cols);
+          if (result.ok) {
+            createdPara = result.paraIdx;
+            createdCtrl = result.controlIdx;
+            return {
+              sectionIndex: pos.sectionIndex,
+              paragraphIndex: 0,
+              charOffset: 0,
+              parentParaIndex: result.paraIdx,
+              controlIndex: result.controlIdx,
+              cellIndex: 0,
+              cellParaIndex: 0,
+            };
+          }
+          return pos;
+        },
+      });
+      if (createdPara < 0 || createdCtrl < 0) return null;
+      const cells: { cellIdx: number; row: number; col: number }[] = [];
+      try {
+        const bboxes = this.wasm.getTableCellBboxes(pos.sectionIndex, createdPara, createdCtrl);
+        const seen = new Set<number>();
+        for (const bb of bboxes) {
+          if (seen.has(bb.cellIdx)) continue;
+          seen.add(bb.cellIdx);
+          cells.push({ cellIdx: bb.cellIdx, row: bb.row, col: bb.col });
+        }
+      } catch { /* 매핑 실패는 치명적 아님 — 호스트가 row*cols+col 로 폴백 */ }
+      return { sec: pos.sectionIndex, parentPara: createdPara, ctrlIdx: createdCtrl, rows, cols, cells };
+    } catch {
+      return null;
+    }
+  }
+
+  /** [genDOC] 본문 문단의 지정 위치(섹션·문단·오프셋)로 커서를 옮겨 평문을 삽입하고,
+   *  삽입된 문단들의 글자 서식을 본문체로 정규화한다(양식 안내문의 빨강·굵게·작은 글씨를
+   *  검정·비굵게·≥11pt로; 양식의 더 큰 본문 크기는 보존). 위치가 유효하지 않으면 삽입하지
+   *  않고 null. 성공 시 삽입 끝 위치를 반환 — 호스트가 이어지는 청크를 그 위치에 연속
+   *  삽입해 스트리밍처럼 채울 수 있다(자동 초안). */
+  insertTextAtPosition(
+    sectionIndex: number,
+    paragraphIndex: number,
+    charOffset: number,
+    text: string,
+    fontSize?: number,
+    replace = false,
+  ): { sec: number; para: number; charOffset: number } | null {
+    // [genDOC patch 0043 / BAC-865 ①] replace=true: 본문 문단의 기존 내용(양식 시드 '◦'·'-' 등)을
+    // 지우고 채운다. 종전에는 이 인자가 없어 호스트가 replace 를 보내도 조용히 무시되고 앞에
+    // 덧붙었다("ZZZ ◦") — 채운 모든 문단 끝에 마커가 남고 제거할 수단이 없었다.
+    // 순서가 중요하다: 위치를 먼저 검증한 뒤에 지운다. 지우고 나서 실패하면 복구 수단이 없다.
+    if (replace) {
+      if (!this.moveCursorTo({ sectionIndex, paragraphIndex, charOffset: 0 })) return null;
+      const cur = this.wasm.getTextRange(sectionIndex, paragraphIndex, 0, 100000) ?? '';
+      if (cur.length > 0) {
+        // 삭제 실패를 삼키지 않는다 — 못 지운 채 삽입하면 조용히 앞에 덧붙는 그 버그로 되돌아간다.
+        try {
+          this.wasm.deleteRange(sectionIndex, paragraphIndex, 0, paragraphIndex, cur.length);
+        } catch { return null; }
+      }
+      charOffset = 0;
+    }
+    if (!this.moveCursorTo({ sectionIndex, paragraphIndex, charOffset })) return null;
+    this.insertPlainTextAtCursor(text);
+    const end = this.cursor.getPosition();
+    try {
+      for (let p = paragraphIndex; p <= end.paragraphIndex; p++) {
+        const len = (this.wasm.getTextRange(sectionIndex, p, 0, 100000) ?? '').length;
+        if (len === 0) continue;
+        // [genDOC patch 0031] 호스트가 fontSize(1/100pt)를 지정하면 그 크기로 *정확히* 통일한다 —
+        // 문서 대표 본문 크기로 삽입 텍스트를 맞춰 15pt/11pt 널뛰기를 없앤다(autoDraft).
+        // 미지정(구 호스트)이면 기존 정책: 더 큰 본문 크기(예: 14pt 불릿)는 보존, 작은/안내문은 11pt로.
+        let size = 1100;
+        if (typeof fontSize === 'number' && fontSize > 0) {
+          size = fontSize;
+        } else {
+          try {
+            const cur = this.wasm.getCharPropertiesAt(sectionIndex, p, 0).fontSize;
+            if (typeof cur === 'number' && cur > size) size = cur;
+          } catch { /* 기본 크기 사용 */ }
+        }
+        this.wasm.applyCharFormat(
+          sectionIndex,
+          p,
+          0,
+          len,
+          JSON.stringify({ textColor: '#000000', bold: false, fontSize: size }),
+        );
+        // [genDOC] 문단 레벨 page-break 속성 해제 — 양식 placeholder 문단의
+        // keepWithNext/pageBreakBefore 가 split 시 우리가 만든 새 문단들에도 상속되어
+        // "한 문단 쓰고 나면 다음 문단이 다음 페이지로 튀는" 현상이 발생한다(사용자가
+        // 백스페이스+엔터로 다시 split하면 정상 흐름으로 돌아오는 게 그 증거). 이 두 속성을
+        // false로 끄면 인접 문단들이 자연스럽게 같은 페이지에 흘러붙는다.
+        try {
+          this.wasm.applyParaFormat(
+            sectionIndex,
+            p,
+            JSON.stringify({ keepWithNext: false, pageBreakBefore: false, keepLines: false }),
+          );
+        } catch { /* 문단 서식 정규화 실패는 삽입 결과에 영향 없음 */ }
+      }
+      this.eventBus.emit('document-changed'); // 서식 반영 재렌더
+    } catch { /* 서식 정규화 실패는 삽입 결과에 영향 없음 */ }
+    return { sec: sectionIndex, para: end.paragraphIndex, charOffset: end.charOffset };
+  }
+
+  /** [genDOC] 표 셀 안의 지정 위치에 평문을 삽입한다(양식 주도 채움 — 표 셀이면 셀 안으로).
+   *  InsertTextCommand가 cursor 위치에 parentParaIndex가 있으면 insertTextInCell로 자동
+   *  라우팅하므로, 셀 DocumentPosition으로 커서를 놓고 평문 삽입한다. 셀 글자서식도
+   *  본문체(검정·비굵게·≥11pt)로 정규화. 위치 무효면 null, 성공 시 셀 내 끝 위치 반환. */
+  insertTextInCellAtPosition(
+    sec: number,
+    parentPara: number,
+    ctrlIdx: number,
+    cellIdx: number,
+    cellParaIdx: number,
+    charOffset: number,
+    text: string,
+    replace = false,
+    fontSize?: number,
+    replaceAll = false,
+  ): { cellParaIndex: number; charOffset: number } | null {
+    // [genDOC patch 0043 / BAC-865 ②] replaceAll=true: 셀 **전체**(모든 문단)를 비우고 채운다.
+    // replace 는 cellParaIdx 가 가리키는 한 문단만 대체하므로, 2문단짜리 셀에 쓰면
+    // '일반인 일반인 / 대학생 등' 처럼 뒤 문단이 잔존한다. 전체 대체는 0번 문단부터 시작한다.
+    if (replaceAll) { cellParaIdx = 0; charOffset = 0; }
+    try {
+      const rect = this.wasm.getCursorRectInCell(sec, parentPara, ctrlIdx, cellIdx, cellParaIdx, charOffset);
+      if (!rect || rect.pageIndex === undefined) return null;
+    } catch {
+      return null;
+    }
+    if (replaceAll) {
+      // 위치 검증 후에 지운다(본문 replace 와 같은 이유). 실패는 삼키지 않는다 —
+      // 못 지운 채 삽입하면 기존 내용에 덧붙어 조용히 오염된다.
+      try {
+        const cpc = this.wasm.getCellParagraphCount(sec, parentPara, ctrlIdx, cellIdx);
+        const last = Math.max(0, cpc - 1);
+        const lastLen = (this.wasm.getTextInCell(sec, parentPara, ctrlIdx, cellIdx, last, 0, 100000) ?? '').length;
+        if (last > 0 || lastLen > 0) {
+          this.wasm.deleteRangeInCell(sec, parentPara, ctrlIdx, cellIdx, 0, 0, last, lastLen);
+        }
+      } catch { return null; }
+    }
+    // [genDOC] replace=true: 그 셀 문단의 기존 예시(파란 글씨 등) 텍스트를 지우고 채운다.
+    else if (replace) {
+      try {
+        const cur = this.wasm.getTextInCell(sec, parentPara, ctrlIdx, cellIdx, cellParaIdx, 0, 100000) ?? '';
+        if (cur.length > 0) {
+          this.wasm.deleteTextInCell(sec, parentPara, ctrlIdx, cellIdx, cellParaIdx, 0, cur.length);
+        }
+      } catch { /* 삭제 실패해도 삽입은 진행 */ }
+      charOffset = 0;
+    }
+    this.cursor.clearSelection();
+    this.cursor.moveTo({
+      sectionIndex: sec,
+      paragraphIndex: parentPara,
+      parentParaIndex: parentPara,
+      controlIndex: ctrlIdx,
+      cellIndex: cellIdx,
+      cellParaIndex: cellParaIdx,
+      charOffset,
+    });
+    this.cursor.resetPreferredX();
+    this.active = true;
+    this.insertPlainTextAtCursor(text);
+    const end = this.cursor.getPosition();
+    const endCellPara = end.cellParaIndex ?? cellParaIdx;
+    try {
+      const cpc = this.wasm.getCellParagraphCount(sec, parentPara, ctrlIdx, cellIdx);
+      for (let cp = cellParaIdx; cp <= endCellPara && cp < cpc; cp++) {
+        const len = (this.wasm.getTextInCell(sec, parentPara, ctrlIdx, cellIdx, cp, 0, 100000) ?? '').length;
+        if (len === 0) continue;
+        // [genDOC patch 0031] 호스트가 fontSize 를 지정하면 셀 텍스트 크기도 통일한다. 종전의
+        // "셀에서는 size 를 안 건드린다" 정책은 apply_char_format_in_cell 이 페이지 단 폭으로
+        // LineSeg 를 재계산하는 버그 때문이었는데, 0031 에서 셀 폭 기준 reflow(by-path 헬퍼
+        // 재사용)로 고쳐 안전해졌다. 미지정(구 호스트)이면 기존대로 색·굵기만.
+        const props: Record<string, unknown> = { textColor: '#000000', bold: false };
+        if (typeof fontSize === 'number' && fontSize > 0) props.fontSize = fontSize;
+        this.wasm.applyCharFormatInCell(
+          sec, parentPara, ctrlIdx, cellIdx, cp, 0, len,
+          JSON.stringify(props),
+        );
+      }
+      this.eventBus.emit('document-changed');
+    } catch { /* 서식 정규화 실패는 삽입 결과에 영향 없음 */ }
+    return { cellParaIndex: endCellPara, charOffset: end.charOffset };
+  }
+
+  /** [genDOC patch 0031] 본문 문단들의 대표 글자 크기 통계(읽기 전용). 각 비어있지 않은 본문
+   *  문단 첫 글자의 fontSize(1/100pt)를 세어 최빈값(dominant)과 분포(counts)를 돌려준다.
+   *  호스트(autoDraft)가 삽입 텍스트를 문서 본문체 크기로 통일하는 데 쓴다. 실패 문단은 건너뛴다. */
+  getBodyFontSizeStats(): { dominant: number | null; counts: Record<number, number> } {
+    const counts: Record<number, number> = {};
+    try {
+      const secCount = this.wasm.getSectionCount();
+      for (let s = 0; s < secCount; s++) {
+        const pCount = this.wasm.getParagraphCount(s);
+        for (let p = 0; p < pCount; p++) {
+          try {
+            const len = (this.wasm.getTextRange(s, p, 0, 4) ?? '').trim().length;
+            if (len === 0) continue;
+            const size = this.wasm.getCharPropertiesAt(s, p, 0).fontSize;
+            if (typeof size === 'number' && size > 0) counts[size] = (counts[size] ?? 0) + 1;
+          } catch { /* 문단 단위 실패 무시 */ }
+        }
+      }
+    } catch { /* 통계 실패 → dominant=null (호스트가 기존 정책으로 폴백) */ }
+    let dominant: number | null = null;
+    let best = 0;
+    for (const [k, v] of Object.entries(counts)) {
+      if (v > best) { best = v; dominant = Number(k); }
+    }
+    return { dominant, counts };
+  }
+
 
   /** 현재 위치가 빈 누름틀 안내문 영역인지 확인한다. */
   isClickHereGuidePosition(pos: DocumentPosition): boolean {
