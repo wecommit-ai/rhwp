@@ -191,6 +191,9 @@ pub struct DocumentCore {
     /// #2004 immutable compatibility projection과 #2195 sparse width overlay를 소유하며,
     /// **원본 `document`는 무손상**이고 deferred edit은 projection을 직접 mirror하지 않는다.
     pub(crate) render_normalization: RenderNormalizationState,
+    /// [genDOC BAC-1856] 로드 직후 최상위 표별 실측 행 높이 합(px). `sync_grown_table_frames` 가 이보다 커진 표만
+    /// 되쓴다 — 한글 원본도 큰 표는 실측이 선언 높이의 몇 배라 선언값과 비교하면 편집 안 한 표까지 바뀐다.
+    pub(crate) gendoc_table_baseline: HashMap<TableTextReflowKey, f64>,
     /// DPI
     pub(crate) dpi: f64,
     /// 대체 폰트 경로
@@ -517,6 +520,7 @@ impl DocumentCore {
             font_environment: None,
             composed: Vec::new(),
             render_normalization: RenderNormalizationState::default(),
+            gendoc_table_baseline: HashMap::new(),
             dpi: DEFAULT_DPI,
             fallback_font: DEFAULT_FALLBACK_FONT.to_string(),
             layout_engine: LayoutEngine::new(DEFAULT_DPI),

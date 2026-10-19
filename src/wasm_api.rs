@@ -7063,6 +7063,20 @@ impl HwpDocument {
         self.core.reflow_linesegs_on_demand()
     }
 
+    /// [genDOC patch 0012 / BAC-371] 문서 전체 강제 재배치 — 모든 본문·셀 문단 lineseg 재계산 + vpos 재정렬 +
+    /// 2회 paginate. autoDraft 대량 삽입 뒤 호스트가 호출한다. 반환값: 다시 접은 문단 수.
+    #[wasm_bindgen(js_name = forceFullRelayout)]
+    pub fn force_full_relayout(&mut self) -> usize {
+        self.core.relayout_all_on_demand()
+    }
+
+    /// [genDOC BAC-1856] 셀을 채워 늘어난 표의 선언 높이·셀 높이·글자처럼 표 호스트 줄 높이를 실측으로 되쓴다.
+    /// 호스트 저장 직전에 부른다(저장본을 다시 열어도 같은 배치). 반환값: 고친 표 수.
+    #[wasm_bindgen(js_name = syncGrownTableFrames)]
+    pub fn sync_grown_table_frames(&mut self) -> usize {
+        self.core.sync_grown_table_frames()
+    }
+
     /// 배포용(읽기전용) 문서를 편집 가능한 일반 문서로 변환한다.
     ///
     /// 반환값: JSON `{"ok":true,"converted":true}` 또는 `{"ok":true,"converted":false}`

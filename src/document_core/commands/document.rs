@@ -285,6 +285,7 @@ impl DocumentCore {
             font_environment: None,
             composed: Vec::new(),
             render_normalization: super::super::RenderNormalizationState::default(),
+            gendoc_table_baseline: HashMap::new(),
             dpi: DEFAULT_DPI,
             fallback_font: DEFAULT_FALLBACK_FONT.to_string(),
             layout_engine: LayoutEngine::new(DEFAULT_DPI),
@@ -336,6 +337,7 @@ impl DocumentCore {
         doc.rebuild_embedded_exact_font_sources();
         doc.recompose_all_with_horizontal_shaping();
         doc.paginate();
+        doc.gendoc_record_table_baseline();
 
         // [#4488/#4495] 로드 픽스업(손상 lineseg 제거·빈 문단 reflow·안내문 제거)과
         // 첫 paginate 의 materialization(그림 img_dim 등)까지 끝난 뒤 본문을 다시
@@ -1769,6 +1771,210 @@ impl DocumentCore {
         reflowed
     }
 
+    /// [genDOC patch 0012 / BAC-371·BAC-398] 프로그램적 대량 삽입(genDOC autoDraft) 후 문서 전체를 강제 재배치한다.
+    ///
+    /// `reflow_linesegs_on_demand` 는 검증 경고가 있는 문서의 휴리스틱 대상 문단만 다시 접는다. 셀·문단에 흩어
+    /// 삽입한 뒤에는 이미 lineseg 가 있지만 vpos 가 어긋난 문단이 남아 편집 화면과 저장 후 다시 연 화면의 쪽
+    /// 배치가 갈린다(공고 7299: 편집 7쪽, 재열기 5쪽). 이 메서드는 *모든* 본문·셀 문단을 다시 접고 vpos 를
+    /// 처음부터 맞춘 뒤 다시 조판한다. 반환값: 다시 접은 문단 수(본문 + 셀).
+    pub fn relayout_all_on_demand(&mut self) -> usize {
+        let styles = self.resolve_render_styles();
+        let dpi = self.dpi;
+        let hwp3 = self.document.layout_profile().hwp3_layout();
+        let mut count = 0usize;
+
+        // 표 셀 — 중첩 표 재귀(Task #485), 칸 내용 상자는 reflow_linesegs_on_demand 와 같은 계약.
+        fn reflow_table_cells_recursive(
+            table: &mut crate::model::table::Table,
+            styles: &ResolvedStyleSet,
+            dpi: f64,
+            hwp3: bool,
+            count: &mut usize,
+        ) {
+            let owner_widths = table.paragraph_frame_owner_widths();
+            let table_padding = table.padding;
+            for (cell, owner_width) in table.cells.iter_mut().zip(owner_widths) {
+                let cell_w_px = crate::renderer::hwpunit_to_px(owner_width, dpi);
+                let frame_padding = cell.paragraph_frame_padding(&table_padding);
+                let pad_left = crate::renderer::hwpunit_to_px(frame_padding.left as i32, dpi);
+                let pad_right = crate::renderer::hwpunit_to_px(frame_padding.right as i32, dpi);
+                let cell_inner_width =
+                    crate::renderer::composer::cell_inner_text_width(cell_w_px, pad_left, pad_right, dpi);
+                for cell_para in &mut cell.paragraphs {
+                    let pbox = ParagraphBox::content_for_style(
+                        cell_inner_width,
+                        styles.para_styles.get(cell_para.para_shape_id as usize),
+                        dpi,
+                    );
+                    // [genDOC BAC-1667] 셀 안 그림(6755 셀 로고 등)도 본문과 같이 줄 높이를 지킨다.
+                    reflow_keeping_object_host_height(cell_para, pbox, styles, dpi);
+                    *count += 1;
+                    for ctrl in &mut cell_para.controls {
+                        if let Control::Table(ref mut nested) = ctrl {
+                            reflow_table_cells_recursive(nested, styles, dpi, hwp3, count);
+                        }
+                    }
+                }
+                // [genDOC 0049 / 10/12 회귀] 셀 문단 vpos 도 셀 첫 문단부터 이어 맞춘다. 줄 수가 바뀐 문단 뒤
+                // 문단이 겹치거나 거꾸로 가지 않게 한다(공고 7299 참가 서약서).
+                crate::renderer::composer::recalculate_section_vpos(
+                    &mut cell.paragraphs, 0, None, None, styles, dpi, hwp3,
+                );
+            }
+        }
+
+        for section in &mut self.document.sections {
+            let page_def = &section.section_def.page_def;
+            let column_def = Self::find_initial_column_def(&section.paragraphs);
+            let layout = PageLayoutInfo::from_page_def(page_def, &column_def, dpi);
+            let col_width = layout
+                .column_areas
+                .first()
+                .map(|a| a.width)
+                .unwrap_or(layout.body_area.width);
+            for para in section.paragraphs.iter_mut() {
+                let para_style = styles.para_styles.get(para.para_shape_id as usize);
+                reflow_keeping_object_host_height(
+                    para,
+                    ParagraphBox::body_for_style(col_width, para_style, dpi),
+                    &styles,
+                    dpi,
+                );
+                count += 1;
+                for ctrl in &mut para.controls {
+                    if let Control::Table(ref mut table) = ctrl {
+                        reflow_table_cells_recursive(table, &styles, dpi, hwp3, &mut count);
+                    }
+                }
+            }
+            // 전역 vpos 를 구역 처음부터 다시 맞춰 쪽 경계 계산을 일관되게 만든다.
+            crate::renderer::composer::recalculate_section_vpos(
+                &mut section.paragraphs, 0, None, None, &styles, dpi, hwp3,
+            );
+            section.raw_stream = None;
+        }
+
+        // 신규 로드와 같은 재구성 + 조판.
+        self.rebuild_resolved_styles();
+        self.rebuild_embedded_exact_font_sources();
+        self.recompose_all_with_horizontal_shaping();
+        let sec_count = self.document.sections.len();
+        self.dirty_sections = vec![true; sec_count];
+        // BAC-398 — 1차 paginate 가 문단→단 매핑을 현재 내용으로 다시 채운 뒤, 표 측정 캐시만 비우고
+        // 2차 paginate 로 행 높이를 다시 잰다(대량 삽입 후 셀 행 높이 미성장 수정).
+        self.paginate();
+        self.measured_tables = Vec::new();
+        self.measured_sections = Vec::new();
+        self.dirty_paragraphs = Vec::new();
+        self.invalidate_page_tree_cache();
+        self.dirty_sections = vec![true; sec_count];
+        self.paginate();
+        // 늘어난 표의 선언 높이를 실측으로 되써 저장본이 다시 열어도 같은 배치가 되게 한다.
+        self.sync_grown_table_frames();
+        count
+    }
+
+    /// [genDOC v0.8.7 / BAC-1856] 셀을 채워 늘어난 표의 선언 높이를 실측으로 되쓴다.
+    ///
+    /// 옛 엔진도 v0.8.7 도 셀 편집 뒤 표 `common.height`·셀 높이·글자처럼 표 호스트 줄 높이를 갱신하지 않는다.
+    /// 편집 세션에서는 실측으로 배치되지만, 저장 후 다시 열면 v0.8.7 은 저장 조판(선언 높이·lineseg·vpos)을 믿어
+    /// 표 아래가 쪽 밖으로 넘친다(공고 7016 초안 「지원절차」 표: 선언 74.8px·실측 311px). 저장 직전에 실측을
+    /// 모델에 되써 저장본이 스스로 맞도록 한다. 실측이 선언보다 1px 넘게 클 때만, 키우기만 한다.
+    /// 반환값: 고친 표 수.
+    /// [genDOC BAC-1856] 로드 직후 표별 실측 높이를 기준으로 기록한다(`sync_grown_table_frames` 의 비교 기준).
+    pub(crate) fn gendoc_record_table_baseline(&mut self) {
+        self.gendoc_table_baseline.clear();
+        for (si, tables) in self.measured_tables.iter().enumerate() {
+            for m in tables {
+                if let Some(Control::Table(t)) = self.document.sections.get(si)
+                    .and_then(|s| s.paragraphs.get(m.para_index))
+                    .and_then(|p| p.controls.get(m.control_index))
+                {
+                    let rows_px: f64 = m.row_heights.iter().sum::<f64>()
+                        + m.cell_spacing * (m.row_heights.len().saturating_sub(1) as f64);
+                    self.gendoc_table_baseline.insert(super::super::TableTextReflowKey::from_table(t), rows_px);
+                }
+            }
+        }
+    }
+
+    pub fn sync_grown_table_frames(&mut self) -> usize {
+        let dpi = self.dpi;
+        let hwp3 = self.document.layout_profile().hwp3_layout();
+        let to_hu = |px: f64| crate::renderer::px_to_hwpunit(px, dpi).max(0) as u32;
+        let mut fixed = 0usize;
+        let mut touched_sections: Vec<(usize, usize)> = Vec::new();
+        let mut grown_keys: Vec<(super::super::TableTextReflowKey, f64)> = Vec::new();
+        for (si, tables) in self.measured_tables.iter().enumerate() {
+            let Some(section) = self.document.sections.get_mut(si) else { continue };
+            let mut first_para: Option<usize> = None;
+            for m in tables {
+                let Some(para) = section.paragraphs.get_mut(m.para_index) else { continue };
+                let single_line = para.line_segs.len() == 1;
+                let Some(Control::Table(t)) = para.controls.get_mut(m.control_index) else { continue };
+                let declared = crate::renderer::hwpunit_to_px(t.common.height as i32, dpi);
+                let rows_px: f64 = m.row_heights.iter().sum::<f64>()
+                    + m.cell_spacing * (m.row_heights.len().saturating_sub(1) as f64);
+                let key = super::super::TableTextReflowKey::from_table(t);
+                // 로드 뒤 실제로 커진 표만 — 기준이 없는(새로 만들었거나 스냅숏 복원으로 바뀐) 표는 건드리지 않는다.
+                // ponytail: 실행 취소 스냅숏은 표를 복제해 기준을 잃는다 — 그 뒤 편집분은 되쓰지 않는다.
+                let Some(&baseline) = self.gendoc_table_baseline.get(&key) else { continue };
+                if rows_px <= baseline + 1.0 || rows_px <= declared + 1.0 || m.row_heights.is_empty() {
+                    continue;
+                }
+                grown_keys.push((key, rows_px));
+                for cell in &mut t.cells {
+                    let r = cell.row as usize;
+                    let span = (cell.row_span.max(1) as usize).min(m.row_heights.len().saturating_sub(r));
+                    if span == 0 { continue; }
+                    let h: f64 = m.row_heights[r..r + span].iter().sum::<f64>()
+                        + m.cell_spacing * (span.saturating_sub(1) as f64);
+                    cell.height = cell.height.max(to_hu(h));
+                }
+                t.common.height = t.common.height.max(to_hu(rows_px));
+                let new_h = t.common.height as i32;
+                let (tac, margin_v) = (t.common.treat_as_char, i32::from(t.common.margin.top) + i32::from(t.common.margin.bottom));
+                // ponytail: 표 하나만 든 한 줄 호스트만 줄 높이를 고친다. 글과 섞인 여러 줄 호스트는 줄별 소유 계산이 필요.
+                if tac && single_line {
+                    let seg = &mut para.line_segs[0];
+                    let want = new_h + margin_v;
+                    if want > seg.line_height {
+                        seg.line_height = want;
+                        seg.text_height = seg.text_height.max(want);
+                        seg.baseline_distance = seg.baseline_distance.max(want * 850 / 1000);
+                    }
+                }
+                fixed += 1;
+                first_para = Some(first_para.map_or(m.para_index, |p| p.min(m.para_index)));
+            }
+            if let Some(p) = first_para {
+                touched_sections.push((si, p));
+            }
+        }
+        for (key, rows_px) in grown_keys {
+            self.gendoc_table_baseline.insert(key, rows_px);
+        }
+        if fixed > 0 {
+            let styles = self.resolve_render_styles();
+            for (si, p) in touched_sections {
+                let section = &mut self.document.sections[si];
+                crate::renderer::composer::recalculate_section_vpos(
+                    &mut section.paragraphs, p, None, None, &styles, dpi, hwp3,
+                );
+                section.raw_stream = None;
+            }
+            let sec_count = self.document.sections.len();
+            self.recompose_all_with_horizontal_shaping();
+            self.measured_tables = Vec::new();
+            self.measured_sections = Vec::new();
+            self.dirty_paragraphs = Vec::new();
+            self.invalidate_page_tree_cache();
+            self.dirty_sections = vec![true; sec_count];
+            self.paginate();
+        }
+        fixed
+    }
+
     /// 내장 템플릿에서 빈 문서 생성 (네이티브)
     pub fn create_blank_document_native(&mut self) -> Result<String, HwpError> {
         const BLANK_TEMPLATE: &[u8] = include_bytes!("../../../saved/blank2010.hwp");
@@ -3162,6 +3368,64 @@ impl DocumentCore {
                     }
                 }
             }
+        }
+    }
+}
+
+/// [genDOC patch 0045·0046·0049·0054·0058] relayout 용 reflow — 표·그림·그리기 개체를 담은 문단의 첫 줄 높이를
+/// 지킨다(본문·셀 공용).
+///
+/// - 0045(BAC-1655): 비-TAC 표를 담은 문단의 첫 줄 높이는 표 높이다. reflow 는 TAC 만 개체 높이를 반영해
+///   글자 높이로 줄어든다 → 쪽 나눔이 표가 들어간다고 오판해 표가 쪽 끝에서 잘린다. 원본이 더 크면 지킨다.
+/// - 0046(BAC-1667): 그림·그리기 개체 문단도 같다. 글자처럼 취급 개체는 개체 높이가 줄 높이의 하한이다.
+/// - 0054·0058(BAC-1655): 글자 없이(공백만 포함) 개체만 든 여러 줄 문단은 다시 접을 글자가 없다 → 원본 줄 유지.
+/// - 0049(10/12 회귀): 개체 없는 빈 줄은 원본 높이(500·300 같은 간격 줄)를 지킨다.
+fn reflow_keeping_object_host_height(
+    para: &mut Paragraph,
+    paragraph_box: ParagraphBox,
+    styles: &ResolvedStyleSet,
+    dpi: f64,
+) {
+    let has_object = para
+        .controls
+        .iter()
+        .any(|c| matches!(c, Control::Table(_) | Control::Picture(_) | Control::Shape(_)));
+    let orig_first = if has_object { para.line_segs.first().cloned() } else { None };
+    // ponytail: 첫 줄에만 적용 — insertPicture 가 만드는 그림 전용 문단(1줄) 기준. 글 사이에 낀 여러 줄 TAC 그림은 줄별 계산이 필요.
+    let tac_obj_height: i32 = para
+        .controls
+        .iter()
+        .filter_map(|c| match c {
+            Control::Picture(p) if p.common.treat_as_char => Some(p.common.height as i32),
+            Control::Shape(s) if s.common().treat_as_char => Some(s.common().height as i32),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let keep_orig_lines = (has_object
+        && para.text.trim().is_empty()
+        && para.line_segs.len() >= 2
+        && para.line_segs.iter().all(|s| s.line_height > 0))
+        || (para.text.is_empty()
+            && para.controls.is_empty()
+            && para.line_segs.len() == 1
+            && para.line_segs[0].line_height > 0);
+    if keep_orig_lines {
+        return;
+    }
+    reflow_line_segs(para, paragraph_box, styles, dpi);
+    if let (Some(orig), Some(seg)) = (orig_first, para.line_segs.first_mut()) {
+        if orig.line_height > seg.line_height {
+            seg.line_height = orig.line_height;
+            seg.text_height = seg.text_height.max(orig.text_height);
+            seg.baseline_distance = seg.baseline_distance.max(orig.baseline_distance);
+        }
+    }
+    if let Some(seg) = para.line_segs.first_mut() {
+        if tac_obj_height > seg.line_height {
+            seg.line_height = tac_obj_height;
+            seg.text_height = seg.text_height.max(tac_obj_height);
+            seg.baseline_distance = seg.baseline_distance.max(tac_obj_height * 850 / 1000);
         }
     }
 }

@@ -28085,3 +28085,184 @@ fn issue_4576_rebuild_derived_state_recomputes_composition_and_pagination() {
         "페이지 트리가 기준선과 같아야 한다 (옛 코드 잔재 없음)"
     );
 }
+
+// ── [genDOC patch 0012·0014·0045·0046·0049·0054·0058] forceFullRelayout 회귀 ─────────────
+
+/// [0045 / BAC-1655] relayout 이 표를 담은(비-TAC) 문단의 첫 줄 높이(=표 높이)를 글자 높이로 줄이면 안 된다.
+#[test]
+fn test_relayout_keeps_table_host_line_height() {
+    let mut doc = create_doc_with_table();
+    doc.set_dpi(96.0);
+    let big = 30000;
+    if let Some(seg) = doc.document.sections[0].paragraphs[0].line_segs.first_mut() {
+        seg.line_height = big;
+        seg.text_height = big;
+    } else {
+        doc.document.sections[0].paragraphs[0].line_segs.push(LineSeg { line_height: big, text_height: big, ..Default::default() });
+    }
+    doc.paginate();
+    doc.relayout_all_on_demand();
+    let lh = doc.document.sections[0].paragraphs[0].line_segs.first().map(|s| s.line_height).unwrap_or(0);
+    assert!(lh >= big, "표 문단 첫 줄 높이가 relayout 후 줄어듦: {} < {}", lh, big);
+}
+
+/// [0046 / BAC-1667] 그림(도식) 전용 문단 줄 높이를 지키고, 이미 줄어든 lineseg 도 TAC 그림 높이로 복구한다.
+#[test]
+fn test_relayout_keeps_picture_host_line_height() {
+    let mut doc = create_doc_with_table();
+    doc.set_dpi(96.0);
+    let png: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1,
+        8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89, 0, 0, 0, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0, 1, 0, 0,
+        5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let h: u32 = 22_000;
+    doc.insert_picture_native(0, 0, 0, &[], &png, 30_000, h, 1, 1, "png", "[dgm:t] 도식", None, None).unwrap();
+    let pi = doc.document.sections[0].paragraphs.iter()
+        .position(|p| p.controls.iter().any(|c| matches!(c, Control::Picture(_)))).expect("그림 문단");
+    // genDOC insertPicture RPC 는 삽입 뒤 글자처럼 취급으로 바꾼다(운영 0.7.12 동작).
+    for c in &mut doc.document.sections[0].paragraphs[pi].controls {
+        if let Control::Picture(p) = c { p.common.treat_as_char = true; }
+    }
+    doc.relayout_all_on_demand();
+    let lh = doc.document.sections[0].paragraphs[pi].line_segs[0].line_height;
+    assert!(lh >= h as i32, "그림 문단 줄 높이가 relayout 후 줄어듦: {} < {}", lh, h);
+    doc.document.sections[0].paragraphs[pi].line_segs[0].line_height = 900;
+    doc.relayout_all_on_demand();
+    let lh = doc.document.sections[0].paragraphs[pi].line_segs[0].line_height;
+    assert!(lh >= h as i32, "줄어든 그림 문단 줄 높이가 복구되지 않음: {} < {}", lh, h);
+}
+
+/// [0046 / BAC-1667] 표 셀 안의 글자처럼 취급 그림(6755 셀 그림)도 relayout 후 줄 높이를 지킨다.
+#[test]
+fn test_relayout_keeps_cell_picture_host_line_height() {
+    use crate::model::image::Picture;
+    let mut doc = create_doc_with_table();
+    doc.set_dpi(96.0);
+    let ti = doc.document.sections[0].paragraphs.iter()
+        .position(|p| p.controls.iter().any(|c| matches!(c, Control::Table(_)))).expect("표 문단");
+    let h: u32 = 6_677;
+    {
+        let Control::Table(t) = &mut doc.document.sections[0].paragraphs[ti].controls[0] else { panic!() };
+        let cp = &mut t.cells[0].paragraphs[0];
+        let mut pic = Picture::default();
+        pic.common.treat_as_char = true;
+        pic.common.width = 10_000;
+        pic.common.height = h;
+        cp.controls.push(Control::Picture(Box::new(pic)));
+        if cp.line_segs.is_empty() { cp.line_segs.push(Default::default()); }
+        cp.line_segs[0].line_height = 900;
+    }
+    doc.relayout_all_on_demand();
+    let Control::Table(t) = &doc.document.sections[0].paragraphs[ti].controls[0] else { panic!() };
+    let lh = t.cells[0].paragraphs[0].line_segs[0].line_height;
+    assert!(lh >= h as i32, "셀 그림 문단 줄 높이가 relayout 후 줄어듦: {} < {}", lh, h);
+}
+
+/// [0049 / 10/12 회귀, 공고 7299 참가 서약서] 셀 안 빈 문단 vpos 가 증가하고, 빈 간격 줄은 원본 높이(500)를 지킨다.
+#[test]
+fn test_relayout_keeps_cell_empty_para_vpos() {
+    let mut doc = create_doc_with_table();
+    doc.set_dpi(96.0);
+    let ti = doc.document.sections[0].paragraphs.iter()
+        .position(|p| p.controls.iter().any(|c| matches!(c, Control::Table(_)))).expect("표 문단");
+    {
+        let Control::Table(t) = &mut doc.document.sections[0].paragraphs[ti].controls[0] else { panic!() };
+        let first = t.cells[0].paragraphs[0].clone();
+        let mut empty = Paragraph { line_segs: vec![LineSeg { vertical_pos: 1000, line_height: 500, text_height: 500, ..Default::default() }], ..Default::default() };
+        empty.char_shapes = first.char_shapes.clone();
+        let mut last = first.clone();
+        last.line_segs[0].vertical_pos = 2000;
+        t.cells[0].paragraphs = vec![first, empty, last];
+    }
+    doc.relayout_all_on_demand();
+    let Control::Table(t) = &doc.document.sections[0].paragraphs[ti].controls[0] else { panic!() };
+    let segs: Vec<(i32, i32)> = t.cells[0].paragraphs.iter().map(|p| (p.line_segs[0].vertical_pos, p.line_segs[0].line_height)).collect();
+    assert!(segs.windows(2).all(|w| w[0].0 < w[1].0), "셀 문단 vpos 가 증가하지 않음: {:?}", segs);
+    assert_eq!(segs[1].1, 500, "빈 간격 줄 높이가 바뀜: {:?}", segs);
+}
+
+/// [0054 / BAC-1655] 글자 없이 표 두 개만 든 문단(두 줄)은 relayout 뒤에도 두 줄과 둘째 줄 높이를 지킨다.
+#[test]
+fn test_relayout_keeps_object_only_multiline_host() {
+    let mut doc = create_doc_with_table();
+    doc.set_dpi(96.0);
+    let para = &mut doc.document.sections[0].paragraphs[0];
+    let Some(Control::Table(t)) = para.controls.get(0).cloned() else { panic!() };
+    para.controls.push(Control::Table(t));
+    para.text.clear();
+    para.char_offsets.clear();
+    para.line_segs = vec![
+        LineSeg { line_height: 3780, text_height: 3780, line_spacing: 660, ..Default::default() },
+        LineSeg { text_start: 8, vertical_pos: 4440, line_height: 13360, text_height: 13360, line_spacing: 660, ..Default::default() },
+    ];
+    doc.paginate();
+    doc.relayout_all_on_demand();
+    let segs = &doc.document.sections[0].paragraphs[0].line_segs;
+    assert_eq!(segs.len(), 2, "개체만 든 두 줄 문단이 한 줄로 합쳐짐");
+    assert_eq!(segs[1].line_height, 13360, "둘째 줄(둘째 표) 높이가 줄어듦");
+}
+
+/// [0058 / BAC-1655 후속] 공백 두 칸 + 표 두 개 문단(공고 1623 【붙임 3】 아래)도 두 줄을 지킨다.
+#[test]
+fn test_relayout_keeps_whitespace_object_multiline_host() {
+    let mut doc = create_doc_with_table();
+    doc.set_dpi(96.0);
+    let para = &mut doc.document.sections[0].paragraphs[0];
+    let Some(Control::Table(t)) = para.controls.get(0).cloned() else { panic!() };
+    para.controls.push(Control::Table(t));
+    para.text = "  ".to_string();
+    para.char_offsets = vec![16, 17];
+    para.char_count = 19;
+    para.line_segs = vec![
+        LineSeg { line_height: 3373, text_height: 3373, line_spacing: 840, ..Default::default() },
+        LineSeg { text_start: 10, vertical_pos: 4213, line_height: 27881, text_height: 27881, line_spacing: 840, ..Default::default() },
+    ];
+    doc.paginate();
+    doc.relayout_all_on_demand();
+    let segs = &doc.document.sections[0].paragraphs[0].line_segs;
+    assert_eq!(segs.len(), 2, "공백만 든 개체 문단이 한 줄로 합쳐짐");
+    assert_eq!(segs[1].line_height, 27881);
+}
+
+/// [0012 / BAC-371] relayout 은 셀에 흩어 넣은 긴 글을 셀 폭으로 다시 접는다(여러 줄).
+#[test]
+fn test_relayout_reflows_cell_text() {
+    let mut doc = create_doc_with_table();
+    doc.set_dpi(96.0);
+    doc.paginate();
+    let long = "가나다라마바사아자차카타파하거너더러머버서".repeat(6);
+    doc.insert_text_in_cell_native(0, 0, 0, 0, 0, 2, &long).unwrap();
+    let n = doc.relayout_all_on_demand();
+    assert!(n >= 2, "본문+셀 문단을 다시 접어야 함: {n}");
+    let Some(Control::Table(t)) = doc.document.sections[0].paragraphs[0].controls.get(0) else { panic!() };
+    assert!(t.cells[0].paragraphs[0].line_segs.len() >= 4, "셀 폭으로 여러 줄: {}", t.cells[0].paragraphs[0].line_segs.len());
+}
+
+
+/// [genDOC BAC-1856] 셀을 채워 늘어난 표는 저장 전에 선언 높이·셀 높이·글자처럼 표 호스트 줄 높이를 실측으로 되쓴다
+/// (v0.8.7 은 다시 열 때 저장 조판을 믿어, 되쓰지 않으면 표 아래가 쪽 밖으로 넘친다 — 공고 7016 초안).
+#[test]
+fn gendoc_sync_grown_table_frames_writes_back_measured_heights() {
+    let mut doc = create_doc_with_table();
+    doc.set_dpi(96.0);
+    let (declared, cell_h) = if let Some(Control::Table(t)) = doc.document.sections[0].paragraphs[0].controls.get_mut(0) {
+        t.common.treat_as_char = true;
+        (t.common.height, t.cells[0].height)
+    } else { panic!("표 없음") };
+    doc.document.sections[0].paragraphs[0].line_segs = vec![LineSeg { line_height: declared as i32, text_height: declared as i32, ..Default::default() }];
+    doc.paginate();
+    doc.gendoc_record_table_baseline(); // 로드 직후 기준(편집 전 실측)
+    assert_eq!(doc.sync_grown_table_frames(), 0, "편집 전에는 되쓸 표가 없어야 함");
+    let long = "가나다라마바사아자차카타파하거너더러머버서".repeat(8);
+    doc.insert_text_in_cell_native(0, 0, 0, 0, 0, 0, &long).unwrap();
+    doc.paginate();
+    let fixed = doc.sync_grown_table_frames();
+    let Some(Control::Table(t)) = doc.document.sections[0].paragraphs[0].controls.get(0) else { panic!() };
+    assert_eq!(fixed, 1);
+    assert!(t.common.height > declared, "선언 높이 되쓰기: {} → {}", declared, t.common.height);
+    assert!(t.cells[0].height > cell_h, "셀 높이 되쓰기: {} → {}", cell_h, t.cells[0].height);
+    let lh = doc.document.sections[0].paragraphs[0].line_segs[0].line_height;
+    assert!(lh >= t.common.height as i32, "호스트 줄 높이 되쓰기: {lh} < {}", t.common.height);
+    assert_eq!(doc.sync_grown_table_frames(), 0, "두 번째 호출은 고칠 것이 없어야 함");
+}
