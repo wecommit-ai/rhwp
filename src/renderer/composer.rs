@@ -1328,7 +1328,17 @@ fn compose_lines(para: &Paragraph) -> Vec<ComposedLine> {
         // 강제 줄넘김(\n) + TAC 표 문단 처리 (Task #19/Task #20)
         // 아래 범위와 take/skip은 문자 인덱스다. UTF-8 바이트 위치를 쓰면
         // 한글 제목 뒤 개행이 줄 끝을 넘어 표 줄까지 제목에 합쳐진다.
-        let newline_pos = line_text.chars().position(|ch| ch == '\n');
+        // [genDOC patch 0067 / BAC-1843] \n 뒤에 이 줄(LINE_SEG) 안에서 무언가(표 등)가 이어질 때만
+        // 「\n 앞 + 표 줄」로 나눈다. 줄 끝 \n 까지 나누면 빈 줄이 하나 더 생겨 셀 문단의 글자처럼 표가
+        // 엉뚱한 줄·x 로 그려졌다(1623 8쪽 연도표 25자 잘림). 줄 끝 \n 은 아래 일반 경로가 줄로 다룬다.
+        let newline_pos = line_text.chars().position(|ch| ch == '\n').filter(|&nl| {
+            let nl_utf16 = para
+                .char_offsets
+                .get(text_start + nl)
+                .copied()
+                .unwrap_or((text_start + nl) as u32);
+            nl_utf16 + 1 < utf16_end
+        });
         if let (true, Some(nl_pos)) = (has_tac, newline_pos) {
             let pre_text: String = line_text.chars().take(nl_pos).collect();
             let pre_end = text_start + nl_pos;

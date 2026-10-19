@@ -2338,3 +2338,32 @@ fn owned_rowbreak_tac_height_selects_current_or_multirow_frames() {
         "가시 텍스트와 같은 줄은 별도 구성 계약"
     );
 }
+
+/// [genDOC 0067 / BAC-1843] 줄마다 \n 으로 끝나는 셀 문단 + 셋째 줄의 글자처럼 표(1623 8쪽 연도표).
+/// \n 이 줄 끝에 있으면 일반 줄로 다뤄야 한다 — 종전엔 앞 글을 이전 줄에 붙이고 빈 줄을 더 만들어
+/// 줄 시작 위치가 뒤엉켰고, 표가 엉뚱한 줄·x 에 그려졌다.
+#[test]
+fn bac1843_tac_table_para_line_end_newlines_keep_line_segs() {
+    let mut tbl = crate::model::table::Table::default();
+    tbl.common.treat_as_char = true;
+    let mut char_offsets: Vec<u32> = (0..=12).collect();
+    char_offsets.extend([21, 22, 23, 24, 25]); // 13..20 = 표 컨트롤(8칸)
+    let para = Paragraph {
+        text: "재무 계획\nㅇ 매출\n  \nㅇ 구조".to_string(),
+        char_offsets,
+        char_count: 27,
+        line_segs: [0u32, 6, 11, 22].iter().map(|&ts| LineSeg { text_start: ts, line_height: 1100, ..Default::default() }).collect(),
+        controls: vec![Control::Table(Box::new(tbl))],
+        ..Default::default()
+    };
+    let composed = compose_paragraph(&para);
+    let got: Vec<(usize, String)> = composed.lines.iter()
+        .map(|l| (l.char_start, l.runs.iter().map(|r| r.text.as_str()).collect::<String>()))
+        .collect();
+    assert_eq!(got, vec![
+        (0, "재무 계획".to_string()),
+        (6, "ㅇ 매출".to_string()),
+        (11, "  ".to_string()),
+        (14, "ㅇ 구조".to_string()),
+    ]);
+}
