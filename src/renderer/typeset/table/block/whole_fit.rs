@@ -6,7 +6,7 @@ use crate::renderer::typeset::{
     line_seg_visible_bounds_px, native_hwp5_saved_rowbreak_tail_frame_matches,
     para_has_non_whitespace_text, para_has_visible_text,
     rowbreak_table_has_internal_saved_vpos_reset, signed_hwpunit, table,
-    table_declared_height_has_stored_cell_content_frame,
+    table_declared_height_has_stored_cell_content_frame, gendoc_table_has_stale_cell_frames,
     table_declared_object_covers_cell_row_frames, PageItem, TypesetEngine, TypesetState,
 };
 
@@ -652,7 +652,10 @@ impl TypesetEngine {
             && !st.current_items.is_empty()
             && st.current_height + declared_object_total <= available
             && !hwpx_tac_cell_leftover_missing_owned_line;
-        let declared_table_whole_fits = near_measured_rowbreak_fits
+        // [genDOC BAC-1856] 셀 저장 줄이 선언 셀 높이를 넘는 표(옛 genDOC 저장본)는 선언 높이가 원본 프레임이
+        // 아니다 — 선언 기준 통째 수용을 끄고 실측 행 높이로 나눈다(실제 초안 680 1쪽 112자 쪽 밖).
+        let stale_declared_frame = gendoc_table_has_stale_cell_frames(table, self.dpi);
+        let declared_table_whole_fits = !stale_declared_frame && (near_measured_rowbreak_fits
             || hwpx_tac_cell_leftover_declared_fits
             || (!uses_painted_row_footprint_for_whole_fit
                 && declared_fit_scope_ok
@@ -664,7 +667,7 @@ impl TypesetEngine {
                 && !ft.strict_following_plain_text_fit
                 && (!table.common.treat_as_char || hwpx_noninline_tac_measured_fit)
                 && declared_object_total > host_spacing_total
-                && st.current_height + declared_fit_height <= available);
+                && st.current_height + declared_fit_height <= available));
         // 빈 host의 단일 inline 표에서 저장 LineSeg 높이와 table common 높이가
         // 정확히 같으면, 그 LineSeg는 표의 실제 physical frame이다. 누적 측정이
         // source top을 지나쳤더라도 frame 전체가 현재 body 안에 있으면 source

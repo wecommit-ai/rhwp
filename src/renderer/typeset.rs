@@ -1902,6 +1902,40 @@ fn rowbreak_table_has_internal_saved_vpos_reset(table: &crate::model::table::Tab
 /// renderer metric expansion from a source-owned row growth without a table
 /// size ratio or a pixel cap. Rowspans and controls have independent physical
 /// ownership, so they stay on the measured-row path.
+/// [genDOC BAC-1856] 셀 저장 줄이 선언 셀 높이를 넘는 표 — 선언 높이가 낡았다.
+///
+/// 한글은 셀에 글을 넣으면 셀 높이를 줄에 맞춰 늘린 뒤 저장하므로, 한글 저장본에서는 저장 줄 바닥 +
+/// 위아래 여백이 선언 셀 높이를 넘지 않는다. 옛 genDOC 엔진(0.7.12)은 셀을 채운 뒤 셀·표 높이를
+/// 되쓰지 않아서 이 형상이 생긴다(실제 초안 680: 선언 4628HU 칸에 줄 4개 이상). 이런 표는 선언 높이를
+/// 원본 프레임으로 믿으면 표 아래가 쪽 밖으로 나간다.
+pub(in crate::renderer::typeset) fn gendoc_table_has_stale_cell_frames(
+    table: &crate::model::table::Table,
+    dpi: f64,
+) -> bool {
+    table.cells.iter().any(|cell| {
+        if cell.row_span != 1 || cell.height == 0 || cell.height >= 0x8000_0000 {
+            return false;
+        }
+        if cell.paragraphs.iter().any(|p| !p.controls.is_empty()) {
+            return false;
+        }
+        let stored_bottom = cell
+            .paragraphs
+            .iter()
+            .filter(|p| !p.text.replace(|c: char| c.is_control(), "").trim().is_empty())
+            .flat_map(|p| p.line_segs.iter())
+            .filter(|seg| !is_synthetic_line_seg(seg) && seg.vertical_pos >= 0 && seg.line_height > 0)
+            .map(|seg| seg.vertical_pos.saturating_add(seg.line_height))
+            .max();
+        let Some(bottom) = stored_bottom else {
+            return false;
+        };
+        let pad = cell.padding.top as i32 + cell.padding.bottom as i32;
+        hwpunit_to_px(bottom.saturating_add(pad.max(0)), dpi)
+            > hwpunit_to_px(cell.height as i32, dpi) + 4.0
+    })
+}
+
 fn table_declared_height_has_stored_cell_content_frame(
     table: &crate::model::table::Table,
     dpi: f64,

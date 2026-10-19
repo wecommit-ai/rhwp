@@ -10115,6 +10115,22 @@ fn test_template_comparison() {
 }
 
 /// 손상 HWP vs 정상 HWP 종합 비교 (DocInfo ID_MAPPINGS + BodyText Section 0 전체 레코드)
+/// [genDOC BAC-1856] 옛 genDOC 엔진이 셀을 채워 저장한 HWPX(셀 저장 줄이 선언 셀 높이를 넘음)를 다시 열면
+/// 글자처럼 표를 선언 높이로 통째 배치해 표 아래가 쪽 밖으로 나갔다(실제 초안 680 1쪽 112자).
+/// 픽스처: 실제 QA 초안 680 의 1쪽 분량(최상위 문단 9개), 개인정보 문자열 치환.
+#[test]
+fn gendoc_stale_cell_frames_tac_table_splits_instead_of_declared_whole_fit() {
+    let data = std::fs::read("samples/gendoc/gendoc-stale-cell-frames.hwpx").unwrap();
+    let mut doc = HwpDocument::from_bytes(&data).unwrap();
+    doc.paginate();
+    let first = &doc.pagination[0].pages[0];
+    let items: Vec<String> = first.column_contents.iter().flat_map(|c| c.items.iter()).map(|it| format!("{it:?}")).collect();
+    assert!(
+        items.iter().any(|s| s.contains("PartialTable") && s.contains("para_index: 7")),
+        "1쪽 14행 표(선언 557px·실측 942px)가 행 분할되지 않고 통째 배치됨: {items:?}"
+    );
+}
+
 #[test]
 fn test_complex_comparison() {
     use crate::parser::cfb_reader::CfbReader;
@@ -12157,6 +12173,21 @@ fn test_rp005_pasted_table_analysis() {
 /// 3개 HWP 파일 비교: empty-step2 원본, HWP 프로그램 붙여넣기, 뷰어 붙여넣기(손상)
 ///
 /// DocInfo ID_MAPPINGS, BodyText 레코드 전체 덤프, 레코드별 차이 비교
+/// [genDOC BAC-1856] 옛 genDOC 엔진이 중첩 표 칸을 채우고 줄 높이를 되쓰지 않은 HWPX: 셀 안 글자처럼 중첩 표의
+/// 저장 줄 높이(3132HU = 41.8px)가 실측(약 197px)보다 작아, 행 안 줄 단위 컷이 조각을 본문 밖으로 넘겼다
+/// (실제 초안 694 7쪽 73자). 로드할 때 그 줄 높이를 실측으로 고친다.
+/// 픽스처: 실제 QA 초안 694 의 「회사 소개」 16×1 표 문단만 남긴 것.
+#[test]
+fn gendoc_stale_nested_tac_line_height_is_repaired_on_load() {
+    let data = std::fs::read("samples/gendoc/gendoc-stale-nested-tac-line.hwpx").unwrap();
+    let doc = HwpDocument::from_bytes(&data).unwrap();
+    let para = doc.document.sections[0].paragraphs.iter().find(|p| p.controls.iter().any(|c| matches!(c, Control::Table(t) if t.row_count == 16))).expect("16행 표");
+    let Some(Control::Table(t)) = para.controls.iter().find(|c| matches!(c, Control::Table(t) if t.row_count == 16)) else { panic!() };
+    let host = t.cells[7].paragraphs.iter().filter(|p| p.controls.iter().any(|c| matches!(c, Control::Table(_)))).last().expect("중첩 표 문단");
+    let lh = host.line_segs.iter().map(|s| s.line_height).max().unwrap();
+    assert!(crate::renderer::hwpunit_to_px(lh, 96.0) > 150.0, "중첩 표 줄 높이가 실측으로 고쳐지지 않음: {lh}HU");
+}
+
 #[test]
 fn test_step2_comparison() {
     use crate::parser::cfb_reader::CfbReader;

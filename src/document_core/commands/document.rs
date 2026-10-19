@@ -263,6 +263,7 @@ impl DocumentCore {
             include_cell_empty,
         );
         Self::clear_missing_lineseg_placeholders(&mut document);
+        Self::gendoc_repair_stale_nested_tac_lines(&mut document, &styles, DEFAULT_DPI);
 
         // XML import → HWP 라운드트립 일관성 normalize (#314):
         // XML 파서가 채우지 않는 paragraph 필드를 HWP 직렬화/파싱 라운드트립 결과와 일치시킨다.
@@ -490,6 +491,69 @@ impl DocumentCore {
     /// 순수 빈 문단**만 CharPr 크기 기반 줄박스 합성(86712 1pt 빈 문단 오라클).
     /// 본문 문단·셀 텍스트 문단·컨트롤 호스트 문단은 각각 em 폴백(#2070 축3)·
     /// composer recompose·typeset 표 줄 계산이 담당하므로 제외한다(stage68).
+    /// [genDOC BAC-1856] 셀 안 글자처럼 중첩 표의 저장 줄 높이가 그 표의 실측보다 작은 줄을 고친다.
+    ///
+    /// 한글은 중첩 표가 자라면 그 줄 높이(vertsize)를 표 높이로 저장하므로 한글 저장본에는 이 형상이 없다.
+    /// 옛 genDOC 엔진은 중첩 표 칸을 채우고 줄 높이를 되쓰지 않았다(실제 초안 694 「재무 확보 계획」:
+    /// 저장 줄 41.8px·실측 197px). 행 안 줄 단위 컷이 그 줄을 작게 세어 조각이 본문을 넘쳤다.
+    /// 최상위 표 셀의 그 줄만 실측으로 고치고 셀 문단 vpos 를 다시 잇는다(문단 단위, 전체 reflow 아님).
+    /// 반환값: 고친 줄 수.
+    pub(crate) fn gendoc_repair_stale_nested_tac_lines(
+        document: &mut Document,
+        styles: &ResolvedStyleSet,
+        dpi: f64,
+    ) -> usize {
+        let profile = document.layout_profile();
+        let measurer = crate::renderer::height_measurer::HeightMeasurer::new(dpi)
+            .with_native_hwp5(profile.native_hwp5_layout())
+            .with_hwpx_stored_layout(profile.hwpx_stored_layout());
+        let hwp3 = profile.hwp3_layout();
+        let mut fixed = 0usize;
+        for section in &mut document.sections {
+            for para in &mut section.paragraphs {
+                for ctrl in &mut para.controls {
+                    let Control::Table(table) = ctrl else { continue };
+                    for cell in &mut table.cells {
+                        let mut cell_fixed = false;
+                        for cp in &mut cell.paragraphs {
+                            if cp.line_segs.is_empty() || cp.line_segs.iter().all(|s| s.tag & 0x8000_0000 != 0) {
+                                continue;
+                            }
+                            let nested_hu = cp
+                                .controls
+                                .iter()
+                                .filter_map(|c| match c {
+                                    Control::Table(nested) if nested.common.treat_as_char => {
+                                        let mt = measurer.measure_table(nested, 0, 0, styles);
+                                        Some(crate::renderer::px_to_hwpunit(mt.total_height, dpi)
+                                            + i32::from(nested.common.margin.top)
+                                            + i32::from(nested.common.margin.bottom))
+                                    }
+                                    _ => None,
+                                })
+                                .max();
+                            let Some(nested_hu) = nested_hu else { continue };
+                            let Some(seg) = cp.line_segs.iter_mut().max_by_key(|s| s.line_height) else { continue };
+                            if crate::renderer::hwpunit_to_px(nested_hu - seg.line_height, dpi) > 4.0 {
+                                seg.line_height = nested_hu;
+                                seg.text_height = seg.text_height.max(nested_hu);
+                                seg.baseline_distance = seg.baseline_distance.max(nested_hu * 850 / 1000);
+                                cell_fixed = true;
+                                fixed += 1;
+                            }
+                        }
+                        if cell_fixed {
+                            crate::renderer::composer::recalculate_section_vpos(
+                                &mut cell.paragraphs, 0, None, None, styles, dpi, hwp3,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        fixed
+    }
+
     fn reflow_zero_height_paragraphs(
         document: &mut Document,
         styles: &ResolvedStyleSet,
