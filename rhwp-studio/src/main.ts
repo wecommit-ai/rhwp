@@ -2633,6 +2633,44 @@ function genDocRpc(method: string, params: any): Promise<unknown> {
         }
         break;
       }
+      // [genDOC patch 0017 / FE-1652] 셀 안 문단 지우기 — fromPara 부터 count 개. 문단 경계를 지우는 RPC 가
+      // 없어(deleteRangeInCell 은 한 문단 안만) 초안을 다시 만들 때 짧아진 답 뒤에 빈 문단이 남았다.
+      // 뒤에서부터 글을 비우고 앞 문단에 병합(셀 안 Backspace)한다. 중첩 표가 든 문단과 셀 첫 문단은
+      // 지우지 않고 건너뛴다 — 호출자가 잘못 짚어도 양식 상자를 지우지 않게.
+      case 'deleteCellParagraphs': {
+        await initPromise;
+        try {
+          const sec = Number(params?.sec ?? 0);
+          const parentPara = Number(params?.parentPara ?? 0);
+          const ctrlIdx = Number(params?.ctrlIdx ?? 0);
+          const cellIdx = Number(params?.cellIdx ?? 0);
+          const fromPara = Math.max(1, Math.trunc(Number(params?.fromPara ?? 0)));
+          const count = Math.max(0, Math.trunc(Number(params?.count ?? 0)));
+          const total = wasm.getCellParagraphCount(sec, parentPara, ctrlIdx, cellIdx);
+          let removed = 0;
+          for (let cp = Math.min(total, fromPara + count) - 1; cp >= fromPara; cp--) {
+            // 중첩 표(작성 요령 상자 등)가 든 문단은 건너뛴다. 길이(getCellParagraphLength)는 개체를 세지 않아 표로 확인한다.
+            let hasTable = false;
+            for (let k = 0; k < 5 && !hasTable; k++) {
+              const pathJson = JSON.stringify([
+                { controlIndex: ctrlIdx, cellIndex: cellIdx, cellParaIndex: cp },
+                { controlIndex: k, cellIndex: 0, cellParaIndex: 0 },
+              ]);
+              try { hasTable = typeof wasm.getTableDimensionsByPath(sec, parentPara, pathJson)?.cellCount === 'number'; } catch { /* 표 아님 */ }
+            }
+            if (hasTable) continue;
+            const len = wasm.getCellParagraphLength(sec, parentPara, ctrlIdx, cellIdx, cp);
+            if (len > 0) wasm.deleteTextInCell(sec, parentPara, ctrlIdx, cellIdx, cp, 0, len);
+            wasm.mergeParagraphInCell(sec, parentPara, ctrlIdx, cellIdx, cp);
+            removed++;
+          }
+          if (removed > 0) eventBus.emit('document-changed');
+          reply({ ok: true, removed });
+        } catch (e: any) {
+          reply(undefined, e?.message || String(e));
+        }
+        break;
+      }
       // [genDOC host integration] 중첩 표(요약표·산출물의 안쪽 표) 셀에 평문 삽입.
       // path는 [{controlIndex, cellIndex, cellParaIndex}, ...] 형식의 평면 경로(getFormSkeleton의 nested[].path 그대로).
       // cursor를 통하지 않고 엔진 직호출 — 깊은 중첩에 cursor DocumentPosition 한 단계 한계가 있기 때문.
