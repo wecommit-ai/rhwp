@@ -1432,6 +1432,19 @@ export function onDblClick(this: any, e: MouseEvent): void {
       this.promptAssignPictureImage(ref);
       return;
     }
+    // [genDOC] 도표 그림(description 에 [dgm:id] 마커) 더블클릭 → 호스트에 편집 요청.
+    // genDOC 이 생성한 도표만 반응하고, 일반 그림은 기본 동작을 유지한다.
+    if (ref && ref.type === 'image' && ref.cellIdx === undefined && !ref.headerFooter) {
+      try {
+        const props = this.wasm.getPictureProperties(ref.sec, ref.ppi, ref.ci);
+        const desc: string = props?.description ?? '';
+        if (desc.includes('[dgm:')) {
+          e.preventDefault();
+          window.parent.postMessage({ type: 'gendoc:rhwp:picture-dblclick', description: desc }, '*');
+          return;
+        }
+      } catch { /* 그림 속성 조회 실패 시 기본 동작 */ }
+    }
     // 수식 객체 → 수식 편집 대화상자
     if (ref && ref.type === 'equation') {
       e.preventDefault();
