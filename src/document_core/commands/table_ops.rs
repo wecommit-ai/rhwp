@@ -1044,9 +1044,20 @@ impl DocumentCore {
             ))
         })?;
 
+        // [genDOC patch 0007 / BAC-434] 셀 안에 그림/도형(텍스트박스)/표/수식 등 개체가 있는지 — 있으면
+        // 호스트가 그 칸엔 텍스트를 채우지 않는다(개체를 밀어내 정렬이 깨지는 것 방지).
+        // [genDOC patch 0047 / BAC-1668] 양식 개체(☐ 체크박스 등) 칸은 선택지다. 텍스트로 채우지 않는다.
+        let has_object = cell.paragraphs.iter().any(|p| {
+            p.controls.iter().any(|c| matches!(
+                c,
+                Control::Shape(_) | Control::Picture(_) | Control::Table(_) | Control::Equation(_)
+                    | Control::Form(_)
+            ))
+        });
+
         Ok(format!(
-            "{{\"row\":{},\"col\":{},\"rowSpan\":{},\"colSpan\":{}}}",
-            cell.row, cell.col, cell.row_span, cell.col_span
+            "{{\"row\":{},\"col\":{},\"rowSpan\":{},\"colSpan\":{},\"hasObject\":{}}}",
+            cell.row, cell.col, cell.row_span, cell.col_span, has_object
         ))
     }
 
