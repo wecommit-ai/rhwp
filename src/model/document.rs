@@ -366,6 +366,10 @@ pub struct SectionDef {
     pub extra_child_records: Vec<RawRecord>,
     /// 바탕쪽 (extra_child_records에서 파싱, 렌더링 전용)
     pub master_pages: Vec<MasterPage>,
+    /// [genDOC BAC-2300] HWP5 구역 끝 메모 꼬리(MEMO_LIST·LIST_HEADER·메모 문단) 원본 레코드.
+    /// HWP5 파서는 메모 본문을 `Field.memo_paragraphs` 로 읽지 않으므로, 편집으로 구역을
+    /// 다시 쓸 때 원본 바이트 그대로 되돌려 메모가 사라지지 않게 한다.
+    pub memo_tail_records: Vec<RawRecord>,
 }
 
 impl Document {

@@ -128,6 +128,21 @@ fn serialize_section_inner(section: &Section, version: Option<u32>) -> Vec<u8> {
     }
     if has_memo_tail {
         serialize_memo_tail(section, &memo_lists, &mut records);
+    } else {
+        // [genDOC BAC-2300] HWP5 원본의 메모 꼬리는 모델로 읽지 않으므로 원본 레코드를
+        // 그대로 되돌린다. 메모 root 문단은 원본대로 마지막 문단(is_last)으로 이미 쓰였다.
+        records.extend(
+            section
+                .section_def
+                .memo_tail_records
+                .iter()
+                .map(|r| Record {
+                    tag_id: r.tag_id,
+                    level: r.level,
+                    size: r.data.len() as u32,
+                    data: r.data.clone(),
+                }),
+        );
     }
     serialize_master_page_tail(section, &mut records);
     // 변경추적 병합 문단 여부(UINT16)는 5.0.3.2부터 존재한다. 재귀로 생성한
@@ -1264,11 +1279,25 @@ fn field_end_marker(ctrl: &Control) -> FieldEndMarker {
             }
         }
         Control::Field(field) => FieldEndMarker {
-            ctrl_id: field.ctrl_id,
+            ctrl_id: hancom_field_end_id(field.ctrl_id),
             memo_index: 0,
         },
         _ => FieldEndMarker::default(),
     }
+}
+
+/// [genDOC BAC-2300] 한글은 FIELD_END 표식의 ctrl_id 끝 바이트('%')를 필드 종류별 값으로 쓴다.
+/// 실측(한글 원본 HWP 코퍼스, 종류마다 값이 하나): `%clk` 09, `%fmu` 08, `%bmk` 02, `%hlk` 00.
+/// 모르는 종류는 종전대로 시작 id 를 그대로 쓴다.
+fn hancom_field_end_id(ctrl_id: u32) -> u32 {
+    let tail: u32 = match ctrl_id {
+        tags::FIELD_CLICKHERE => 0x09,
+        tags::FIELD_FORMULA => 0x08,
+        tags::FIELD_BOOKMARK => 0x02,
+        tags::FIELD_HYPERLINK => 0x00,
+        _ => return ctrl_id,
+    };
+    (ctrl_id & 0x00FF_FFFF) | (tail << 24)
 }
 
 fn memo_field_index(field: &crate::model::control::Field) -> u32 {
@@ -1479,6 +1508,14 @@ fn control_char_code_and_id(ctrl: &Control) -> (u16, u32) {
         // 통째로 버린다(0자·1쪽). `CTRL_CHAR_OVERLAP` 상수는 이름과 달리 'tdut'(덧말)이다.
         Control::Ruby(_) => (0x0017, tags::CTRL_CHAR_OVERLAP),
         Control::CharOverlap(_) => (0x0017, tags::CTRL_TCPS),
+        // [genDOC BAC-2300] 한글은 메모 필드의 CTRL_HEADER 를 `%unk`(command `MEMO/…`)로,
+        // 본문 시작 표식은 `%%me` 로 쓴다. 끝 표식(`field_end_marker`)과 같은 판정을 쓴다.
+        Control::Field(f)
+            if f.field_type == crate::model::control::FieldType::Memo
+                || f.command.starts_with("MEMO/") =>
+        {
+            (0x0003, tags::FIELD_MEMO)
+        }
         Control::Field(f) => (0x0003, f.ctrl_id),
         Control::Equation(_) => (0x000B, tags::CTRL_EQUATION),
         Control::Form(_) => (0x000B, tags::CTRL_FORM),

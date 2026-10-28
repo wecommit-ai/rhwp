@@ -122,26 +122,37 @@ pub fn parse_body_text_section(data: &[u8]) -> Result<Section, BodyTextError> {
             .rposition(|r| r.tag_id == tags::HWPTAG_PARA_HEADER && r.level == 0);
         if let Some(lp) = last_para0_idx {
             // 마지막 문단의 본래 자식 레코드 범위 결정 (PARA_TEXT, PARA_CHAR_SHAPE 등)
-            // LIST_HEADER(level=1)가 나타나면 그 이후는 확장 바탕쪽
-            let mut scan = lp + 1;
-            while scan < all_records.len() {
-                if all_records[scan].tag_id == tags::HWPTAG_LIST_HEADER
-                    && all_records[scan].level == 1
-                {
-                    // 확장 바탕쪽 발견
-                    let tail: Vec<RawRecord> = all_records[scan..]
-                        .iter()
-                        .map(|r| RawRecord {
-                            tag_id: r.tag_id,
-                            level: r.level,
-                            data: r.data.clone(),
-                        })
-                        .collect();
-                    let ext_mps = parse_master_pages_from_raw(&tail, 0);
-                    section.section_def.master_pages.extend(ext_mps);
-                    break;
+            // LIST_HEADER(level=1)가 나타나면 그 이후는 확장 바탕쪽.
+            // [genDOC BAC-2300] MEMO_LIST(level=1)로 시작하는 묶음(MEMO_LIST + LIST_HEADER +
+            // 메모 문단)은 메모 꼬리다 — 바탕쪽으로 보내지 않고 원본 레코드로 따로 보관한다.
+            let raw = |r: &Record| RawRecord {
+                tag_id: r.tag_id,
+                level: r.level,
+                data: r.data.clone(),
+            };
+            let mut master_tail: Vec<RawRecord> = Vec::new();
+            let mut in_memo = false;
+            let mut prev_memo_list = false;
+            for r in &all_records[lp + 1..] {
+                let lv1 = r.level == 1;
+                if lv1 && r.tag_id == tags::HWPTAG_MEMO_LIST {
+                    in_memo = true;
+                } else if lv1 && r.tag_id == tags::HWPTAG_LIST_HEADER && !prev_memo_list {
+                    in_memo = false;
+                    master_tail.push(raw(r));
+                    prev_memo_list = false;
+                    continue;
                 }
-                scan += 1;
+                prev_memo_list = lv1 && r.tag_id == tags::HWPTAG_MEMO_LIST;
+                if in_memo {
+                    section.section_def.memo_tail_records.push(raw(r));
+                } else if !master_tail.is_empty() {
+                    master_tail.push(raw(r));
+                }
+            }
+            if !master_tail.is_empty() {
+                let ext_mps = parse_master_pages_from_raw(&master_tail, 0);
+                section.section_def.master_pages.extend(ext_mps);
             }
         }
     }

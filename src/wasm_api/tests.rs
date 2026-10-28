@@ -28317,3 +28317,106 @@ fn gendoc_sync_grown_table_frames_writes_back_measured_heights() {
     assert!(lh >= t.common.height as i32, "호스트 줄 높이 되쓰기: {lh} < {}", t.common.height);
     assert_eq!(doc.sync_grown_table_frames(), 0, "두 번째 호출은 고칠 것이 없어야 함");
 }
+
+/// [genDOC BAC-2300] 한글 원본 HWP 를 한 글자 고쳐 저장해도 메모 꼬리(MEMO_LIST·LIST_HEADER·메모
+/// 문단)와 필드 CTRL_HEADER, 고치지 않은 문단의 PARA_TEXT(필드 시작·끝 표식 포함)가 바이트 그대로
+/// 남아야 한다. 종전에는 HWP5 파서가 메모 본문을 읽지 않아 편집 저장 때 메모가 전부 사라졌다.
+#[test]
+fn gendoc_bac2300_memo_and_field_bytes_survive_edit_save() {
+    use crate::parser::record::Record;
+    use crate::parser::tags;
+    fn recs(bytes: &[u8]) -> Vec<Record> {
+        let doc = crate::parser::parse_hwp(bytes).unwrap();
+        let mut cfb = crate::parser::cfb_reader::CfbReader::open(bytes).unwrap();
+        // 메모 꼬리는 마지막 구역 끝에 있다 — 모든 구역을 이어 본다.
+        (0..doc.sections.len() as u32)
+            .flat_map(|i| {
+                let bt = cfb
+                    .read_body_text_section(i, doc.header.compressed, false)
+                    .unwrap();
+                Record::read_all(&bt).unwrap()
+            })
+            .collect()
+    }
+    fn memo_tail(r: &[Record]) -> Vec<(u16, u16, Vec<u8>)> {
+        let i = r
+            .iter()
+            .position(|x| x.tag_id == tags::HWPTAG_MEMO_LIST)
+            .unwrap_or(r.len());
+        r[i..]
+            .iter()
+            .map(|x| (x.tag_id, x.level, x.data.clone()))
+            .collect()
+    }
+    fn field_headers(r: &[Record]) -> Vec<Vec<u8>> {
+        r.iter()
+            .filter(|x| {
+                x.tag_id == tags::HWPTAG_CTRL_HEADER && x.data.len() >= 4 && x.data[3] == b'%'
+            })
+            .map(|x| x.data.clone())
+            .collect()
+    }
+    fn texts(r: &[Record]) -> Vec<Vec<u8>> {
+        r.iter()
+            .filter(|x| x.tag_id == tags::HWPTAG_PARA_TEXT)
+            .map(|x| x.data.clone())
+            .collect()
+    }
+
+    // 둘 다 한글이 쓴 실제 문서: aift.hwp(메모 2 + 수식 %fmu), NewYear_s_Day.hwp(메모 9).
+    // NewYear_s_Day.hwp 는 옛 한글이 메모 필드 끝 표식을 `01 00 00 00` 으로 써서, 엔진이 고정값
+    // `01 ff ff 00` 으로 다시 쓴다(이번 수정 범위 밖) — 그 파일은 PARA_TEXT 전수 비교를 뺀다.
+    for (path, memos, exact_text) in [
+        ("samples/aift.hwp", 2, true),
+        ("samples/basic/NewYear_s_Day.hwp", 9, false),
+    ] {
+        let data = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let before = recs(&data);
+        assert_eq!(
+            before
+                .iter()
+                .filter(|x| x.tag_id == tags::HWPTAG_MEMO_LIST)
+                .count(),
+            memos,
+            "{path}: 전제(원본 메모 수)"
+        );
+
+        let mut doc = HwpDocument::from_bytes(&data).unwrap();
+        // 컨트롤 없는 글자 문단 하나의 맨 앞에 한 글자.
+        let (sec, target) = doc
+            .document
+            .sections
+            .iter()
+            .enumerate()
+            .find_map(|(si, s)| {
+                s.paragraphs
+                    .iter()
+                    .position(|p| p.controls.is_empty() && !p.text.is_empty())
+                    .map(|pi| (si, pi))
+            })
+            .expect("글자 문단");
+        doc.insert_text_native(sec, target, 0, "가").unwrap();
+        let after = recs(&doc.export_hwp_with_adapter_snapshot().unwrap());
+
+        assert_eq!(
+            memo_tail(&after),
+            memo_tail(&before),
+            "{path}: 메모 꼬리 바이트"
+        );
+        assert_eq!(
+            field_headers(&after),
+            field_headers(&before),
+            "{path}: 필드 CTRL_HEADER"
+        );
+        if !exact_text {
+            continue;
+        }
+        let (a, b) = (texts(&before), texts(&after));
+        assert_eq!(a.len(), b.len(), "{path}: PARA_TEXT 수");
+        let changed = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert_eq!(
+            changed, 1,
+            "{path}: 고친 문단 하나만 PARA_TEXT 가 달라야 함"
+        );
+    }
+}
