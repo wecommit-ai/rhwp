@@ -1015,9 +1015,10 @@ fn parse_master_pages_from_raw(raw_records: &[RawRecord], section_flags: u32) ->
 
         // 영역 0×0 LIST_HEADER는 MEMO/주석 컨트롤의 텍스트 박스가 오분류된 것.
         // 실제 바탕쪽은 반드시 text_width > 0 || text_height > 0.
-        if text_width == 0 && text_height == 0 {
-            continue;
-        }
+        // [gendoc 0025] 단, 안에 도형·그림·표가 있으면 실제 바탕쪽이다. 한컴은 도형만 든
+        // 바탕쪽(15번 IR자료양식의 띠·탭·쪽 번호)의 글 영역을 0×0 으로 저장한다 — 종전
+        // 일괄 건너뜀이 이 바탕쪽을 통째로 버려 한컴독스에는 있는 그림이 안 그려졌다.
+        let zero_area = text_width == 0 && text_height == 0;
 
         // 확장 플래그 (byte 18-19, 표 139 이후)
         let ext_flags = r.read_u16().unwrap_or(0);
@@ -1041,6 +1042,9 @@ fn parse_master_pages_from_raw(raw_records: &[RawRecord], section_flags: u32) ->
         // LIST_HEADER 다음 레코드부터 문단 파싱
         let para_records = &records[start + 1..end];
         let paragraphs = parse_paragraph_list(para_records);
+        if zero_area && !paragraphs.iter().any(|p| !p.controls.is_empty()) {
+            continue;
+        }
 
         // [#6334] 확장 바탕쪽(마지막 쪽·임의 쪽)은 기본 홀/짝 바탕쪽을 **대체**한다.
         //

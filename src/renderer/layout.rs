@@ -5880,8 +5880,13 @@ impl LayoutEngine {
         page_number: u32,
     ) {
         if let Some(mp) = active_master_page {
-            // 영역 0×0 바탕쪽은 MEMO 컨트롤 오분류 방어용 가드 — 렌더링 skip
-            if mp.text_width == 0 && mp.text_height == 0 {
+            // 영역 0×0 바탕쪽은 MEMO 컨트롤 오분류 방어용 가드 — 렌더링 skip.
+            // [gendoc 0025] 도형·그림·표가 든 바탕쪽은 한컴이 글 영역을 0×0 으로 저장하므로
+            // 실제 바탕쪽이다(15번 IR자료양식). 파서(`parse_master_pages_from_raw`)와 같은 기준.
+            if mp.text_width == 0
+                && mp.text_height == 0
+                && !mp.paragraphs.iter().any(|p| !p.controls.is_empty())
+            {
                 return;
             }
             if !mp.paragraphs.is_empty() {
