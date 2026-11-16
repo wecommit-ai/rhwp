@@ -19,13 +19,13 @@ pub(in crate::renderer::typeset) fn layout_drift_safety_px(paragraphs: &[Paragra
     // (k-water-rfp p15 case: PartialTable 직후 작은 텍스트 (16px) 가 잔여 5.3px 부족으로
     // fit 실패하여 다음 페이지로 밀리는 회귀.)
     // [Task #643] VPOS_CORR 백워드 허용 (8px) 으로 layout drift 누적이 해소됨.
-    const DEFAULT_LAYOUT_DRIFT_SAFETY_PX: f64 = 4.0;
-    const ROWBREAK_LAYOUT_DRIFT_SAFETY_PX: f64 = 0.0;
-    if section_has_zero_high_attr_rowbreak_table(paragraphs) {
-        ROWBREAK_LAYOUT_DRIFT_SAFETY_PX
-    } else {
-        DEFAULT_LAYOUT_DRIFT_SAFETY_PX
-    }
+    //
+    // [gendoc 0026] 0 으로 둔다(upstream main 도 같은 결정). 한컴은 쪽 하단 앞에 안전 여유를
+    // 두지 않는다 — 02번 관악입주신청서 마지막 줄은 잔여 17.5px 에 줄 17.3px 가 들어가는데
+    // 4px 마진이 이를 다음 쪽(3쪽)으로 밀었다(한컴독스 2쪽). layout 과 어긋나는 값은 마진이
+    // 아니라 공유 footprint 에서 고쳐야 한다. 30개 양식 쪽수 스윕에서 02 만 바뀌고 회귀 0.
+    let _ = (paragraphs, section_has_zero_high_attr_rowbreak_table);
+    0.0
 }
 
 pub(in crate::renderer::typeset) fn exclusion_probe_height(
