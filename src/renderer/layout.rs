@@ -5959,9 +5959,13 @@ impl LayoutEngine {
                                     // 만 본문 영역으로 교정한다. `Paper`/`Page` 기준은
                                     // compute_object_position 에서 paper_area/body_area 를
                                     // 직접 쓰므로 이 값에 영향받지 않는다.
+                                    // [gendoc 0027] 세로 `Para` 기준은 바탕쪽 문단의 시작점 = 본문
+                                    // 영역 위(머리말 아래)다. 용지 위(0)로 잡으면 15번 IR자료양식의
+                                    // 회색 머리말 상자(vertRelTo=PARA)가 한컴독스보다 본문 위 여백
+                                    // 만큼 위로 올라가 제목 뒤에 깔린다.
                                     let master_col_area = LayoutRect {
                                         x: body_area.x,
-                                        y: paper_area.y,
+                                        y: body_area.y,
                                         width: body_area.width,
                                         height: paper_area.height,
                                     };
@@ -5976,7 +5980,7 @@ impl LayoutEngine {
                                         &master_col_area,
                                         body_area,
                                         &paper_area,
-                                        paper_area.y,
+                                        body_area.y,
                                         Alignment::Left,
                                         bin_data_content,
                                         &std::collections::HashMap::new(),
