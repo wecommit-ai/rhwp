@@ -144,6 +144,10 @@ name = "regression_suite_028"
 path = "tests/generated/regression_suite_028.rs"
 
 [[test]]
+name = "nested_cell_rowbreak_page_count_1118"
+path = "tests/nested_cell_rowbreak_page_count_1118.rs"
+
+[[test]]
 name = "cli_exit_codes"
 path = "tests/cli_exit_codes.rs"
 

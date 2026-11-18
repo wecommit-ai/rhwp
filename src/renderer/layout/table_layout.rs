@@ -3936,6 +3936,31 @@ impl LayoutEngine {
                 .all(|p| !crate::renderer::para_has_no_stored_line_segs(p))
     }
 
+    /// [BAC-2578] 직전 문단이 글자와 중첩표를 함께 가졌고 그 표가 본문 하단을 넘어 쪽 경계에서
+    /// 나뉘는 경우, 다음 문단의 vpos 되감김은 새 쪽 경계가 아니라 **나뉜 표의 남은 부분 뒤로 이어지는
+    /// 같은 쪽의 좌표**다. 한컴이 저장한 줄(`prev`)은 글자 줄만 담아 표 높이를 모르므로, 이 되감김을
+    /// frame 경계로 세우면 그 쪽이 남은 표 조각만 담고 끊겨(별지 제1-⑥호: 쪽의 26%) 한 쪽이 더 생긴다.
+    fn nested_table_straddles_frame_before_rewind(
+        prev_para: &crate::model::paragraph::Paragraph,
+        prev: &crate::model::paragraph::LineSeg,
+        body_height_px: f64,
+        dpi: f64,
+    ) -> bool {
+        if body_height_px <= 0.0 || prev_para.text.trim().is_empty() {
+            return false;
+        }
+        let top_px = hwpunit_to_px(prev.vertical_pos.max(0), dpi);
+        prev_para.controls.iter().any(|control| match control {
+            crate::model::control::Control::Table(table) if !table.common.treat_as_char => {
+                // common.height 는 선언값이라 실제 행 합보다 작을 수 있다(별지 제1-⑥호: 108px vs 320px).
+                let rows = table.get_row_heights().iter().sum::<u32>() as i32;
+                let h = (table.common.height as i32).max(rows);
+                top_px + hwpunit_to_px(h, dpi) > body_height_px
+            }
+            _ => false,
+        })
+    }
+
     /// 앞 행의 저장 상자와 현재 줄 끝이 선언된 첫 표 frame을 정확히 닫는가.
     /// 작은 행 내부 reset도 전체 표의 물리 경계일 수 있다. 셀 자체가 본문
     /// 절반보다 작은지만 보면 2+2 저장 줄을 3+1 또는 4+0으로 소비한다.
@@ -12165,14 +12190,24 @@ impl LayoutEngine {
                 || if pi > 0 && cell_has_local_vpos_origin {
                     // [#7095] 저장 LINE_SEG 가 없는 표 host 문단(p18: 3×3 표)은 비교할 줄이 없다.
                     // 그 앞에서 줄을 가진 가장 가까운 문단의 끝과 비교해야 표 뒤의 되감김을 본다.
-                    let prev_seg = cell.paragraphs[..pi]
+                    let prev_para_with_seg = cell.paragraphs[..pi]
                         .iter()
                         .rev()
-                        .find_map(|para| para.line_segs.last());
+                        .find(|para| !para.line_segs.is_empty());
+                    let prev_seg = prev_para_with_seg.and_then(|para| para.line_segs.last());
                     match (prev_seg, p.line_segs.first()) {
                         (Some(prev_seg), Some(cur_seg))
                             if !line_seg_is_synthetic(prev_seg)
-                                && !line_seg_is_synthetic(cur_seg) =>
+                                && !line_seg_is_synthetic(cur_seg)
+                                // [BAC-2578] 앞 문단의 쪽을 넘는 중첩표 뒤 되감김은 같은 쪽의 이어짐이다.
+                                && !prev_para_with_seg.is_some_and(|para| {
+                                    Self::nested_table_straddles_frame_before_rewind(
+                                        para,
+                                        prev_seg,
+                                        self.current_body_area.get().3,
+                                        self.dpi,
+                                    )
+                                }) =>
                         {
                             let prev_end =
                                 prev_seg.vertical_pos.saturating_add(prev_seg.line_height);
@@ -12210,9 +12245,15 @@ impl LayoutEngine {
                                         && !line_seg_is_synthetic(seg)
                                 })) =>
                     {
-                        next.line_segs
-                            .first()
-                            .is_some_and(|cur| is_stored_frame_rewind(prev, cur))
+                        next.line_segs.first().is_some_and(|cur| {
+                            is_stored_frame_rewind(prev, cur)
+                                && !Self::nested_table_straddles_frame_before_rewind(
+                                    p,
+                                    prev,
+                                    self.current_body_area.get().3,
+                                    self.dpi,
+                                )
+                        })
                     }
                     _ => false,
                 }
@@ -12223,7 +12264,15 @@ impl LayoutEngine {
                 || if pi > 0 && cell_has_local_vpos_origin {
                     let prev_para = &cell.paragraphs[pi - 1];
                     match (prev_para.line_segs.last(), p.line_segs.first()) {
-                        (Some(prev), Some(cur)) => is_stored_frame_rewind(prev, cur),
+                        (Some(prev), Some(cur)) => {
+                            is_stored_frame_rewind(prev, cur)
+                                && !Self::nested_table_straddles_frame_before_rewind(
+                                    prev_para,
+                                    prev,
+                                    self.current_body_area.get().3,
+                                    self.dpi,
+                                )
+                        }
                         _ => false,
                     }
                 } else {
