@@ -1149,6 +1149,16 @@ impl Table {
         self.common.height = total_height;
     }
 
+    /// 행 삽입·삭제는 표 폭을 바꾸지 않는다. `update_ctrl_dimensions` 는 열별 최대 셀 폭의 합으로
+    /// 폭을 다시 계산하는데, 행마다 열 경계가 다른 표(예: 남성/여성 칸이 있는 신청서)는 그 합이 실제
+    /// 폭과 달라(실측 47625 → 42542) 가운데 정렬 표가 오른쪽으로 밀리고 저장본에도 남았다(genDOC 0018).
+    pub(crate) fn sync_ctrl_width(&mut self, width: HwpUnit) {
+        self.common.width = width;
+        if self.raw_ctrl_data.len() >= common_obj_offsets::WIDTH.end {
+            self.raw_ctrl_data[common_obj_offsets::WIDTH].copy_from_slice(&width.to_le_bytes());
+        }
+    }
+
     pub(crate) fn sync_ctrl_height(&mut self, height: HwpUnit) {
         self.common.height = height;
         if self.raw_ctrl_data.len() >= common_obj_offsets::HEIGHT.end {
@@ -1335,6 +1345,7 @@ impl Table {
             .stretched_row_heights()
             .and_then(|heights| heights.get(row_idx as usize).copied());
         let original_height = self.common.height;
+        let original_width = self.common.width;
         let col_widths = self.get_column_widths();
 
         // 셀 height용
@@ -1420,6 +1431,7 @@ impl Table {
 
         // CommonObjAttr 크기 갱신
         self.update_ctrl_dimensions();
+        self.sync_ctrl_width(original_width);
         if let Some(new_row_height) = stretched_new_row_height {
             // 일반 표는 셀 저장 height보다 큰 표시 height를 별도로 가진다.
             // 행 추가 시 표시 기준 행 높이를 더해 표가 납작해지지 않도록 보존한다.
@@ -1571,6 +1583,7 @@ impl Table {
             .stretched_row_heights()
             .and_then(|heights| heights.get(row_idx as usize).copied());
         let original_height = self.common.height;
+        let original_width = self.common.width;
 
         // 삭제 행을 걸치는 병합 셀: row_span 축소
         // [#4264] row/row_span은 파일에서 그대로 온 u16이라 saturating_add 없이
@@ -1608,6 +1621,7 @@ impl Table {
 
         // CommonObjAttr 크기 갱신
         self.update_ctrl_dimensions();
+        self.sync_ctrl_width(original_width);
         if let Some(deleted_row_height) = stretched_deleted_row_height {
             // 일반 표의 표시 높이는 셀 저장 height 합보다 크므로 삭제 행의 표시
             // 높이만큼 외곽 height를 줄여 한컴식 비례를 유지한다.
