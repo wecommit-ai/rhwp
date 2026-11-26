@@ -514,3 +514,7 @@ codegen-units = 16
 # 로컬 vendor로 포함한다. 출처·변경 범위는 vendor/svg2pdf/RHWP_PATCHES.md 참조.
 [patch.crates-io]
 svg2pdf = { path = "vendor/svg2pdf" }
+
+[[test]]
+name = "gendoc_table_row_width"
+path = "tests/gendoc_table_row_width.rs"
